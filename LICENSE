@@ -1,0 +1,54 @@
+Joryio SDK Commercial License
+
+Copyright (c) 2026 Joryio. All rights reserved.
+
+This software development kit, including its source code, compiled forms,
+documentation and samples (the "SDK"), is proprietary to Joryio
+and is licensed, not sold.
+
+1. Grant. Subject to the terms below, Joryio grants you a limited,
+   non-exclusive, non-transferable, non-sublicensable, revocable license to
+   use the SDK solely to integrate it into your own applications and websites
+   in order to use the Joryio service. This license is available only to
+   customers who hold an active Joryio subscription or another active written
+   agreement with Joryio, and only for as long as that subscription or
+   agreement remains in effect.
+
+2. Distribution. You may distribute the SDK only as embedded in, and as an
+   integral part of, your own applications and websites that use the Joryio
+   service. You may not distribute the SDK on its own, as a library, or as
+   part of any toolkit, framework or product whose purpose is to let others
+   build software.
+
+3. Restrictions. Except as expressly permitted above, you may not: (a) copy,
+   modify, publish, redistribute, sell, rent, lease or otherwise make the SDK
+   available to any third party; (b) sublicense the SDK; (c) use the SDK, or
+   any part of it, with any service other than the Joryio service, or to build
+   a product that competes with the Joryio service; or (d) remove or alter any
+   copyright, license or proprietary notice in the SDK. All rights not
+   expressly granted are reserved by Joryio.
+
+4. Termination. This license ends automatically when your Joryio subscription
+   or agreement ends, or if you breach these terms. On termination you must
+   stop using the SDK and stop distributing new copies of applications or
+   websites that include it.
+
+5. No warranty. The SDK is provided "as is" and "as available", without
+   warranty of any kind, express or implied, including any warranty of
+   merchantability, fitness for a particular purpose, title or
+   non-infringement, except as expressly set out in your agreement with
+   Joryio.
+
+6. Limitation of liability. Joryio's liability arising out of or relating to
+   the SDK is limited as set out in your subscription or agreement with
+   Joryio. Where no such limitation applies, and to the maximum extent
+   permitted by law, Joryio will not be liable for any indirect, incidental,
+   special, consequential or punitive damages, or for any loss of profits,
+   revenue, data or goodwill.
+
+7. Governing terms. Your use of the SDK is also governed by the Joryio Terms
+   of Service (https://joryio.com/terms) and by your agreement with Joryio. If
+   this license conflicts with your written agreement with Joryio, your
+   written agreement prevails.
+
+Questions about this license: support@joryio.com
