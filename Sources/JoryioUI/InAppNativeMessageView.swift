@@ -12,8 +12,8 @@ import Joryio
  No web view, and that is the point rather than an optimisation:
 
  - **Security.** There is no interpreter, so a contact attribute containing
-   markup is just text. An app whose policy forbids running authored HTML/JS
-   in-process can use in-app messaging at all.
+   markup is just text. An app whose policy forbids rendering authored HTML
+   in a web view in-process can use in-app messaging at all.
  - **Look.** Dynamic Type, dark mode and VoiceOver come free from UIKit, and
    colours resolve from system semantic colours so the message matches the
    host app instead of shipping its own palette.

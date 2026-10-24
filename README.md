@@ -53,7 +53,9 @@ targets: [
 ]
 ```
 
-### CocoaPods
+### CocoaPods (legacy, up to 1.3.0)
+
+CocoaPods trunk becomes read-only on 2 December 2026, so 1.3.0 is the last version published there; later releases ship through Swift Package Manager only. To move, delete the `pod 'Joryio...'` lines, run `pod install`, and add the package as above. A Notification Service Extension then writes `import JoryioNotificationServiceExtension` instead of `import Joryio`.
 
 ```ruby
 platform :ios, '14.0'

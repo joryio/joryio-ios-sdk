@@ -192,8 +192,11 @@ final class InAppWebMessageView: BaseMessageView {
      `script-src 'none'` is deliberate and stronger than the web SDK's nonce:
      this document contains NO inline script at all - the bridge shim is
      injected as a WKUserScript, which WebKit exempts from the page's CSP. So
-     nothing legitimate needs to execute, and anything that survives the
-     server's sanitiser cannot.
+     nothing legitimate needs to execute, and nothing the author wrote can.
+     The server keeps the markup as written (it drops only <base> and meta
+     refresh), so author script elements, on* handlers and embeds ARE in this
+     document - this CSP is what stops them, not a backstop behind a server
+     sanitiser. Buttons and forms work through the injected bridge.
 
      The media directives are the mixed-content control Android enforced with
      MIXED_CONTENT_NEVER_ALLOW and iOS had no equivalent for: an origin-less
@@ -201,8 +204,8 @@ final class InAppWebMessageView: BaseMessageView {
      stated. `upgrade-insecure-requests` upgrades an author's http image rather
      than simply breaking it.
 
-     style-src stays permissive because the server's sanitiser ALLOWS style=""
-     attributes; styles cannot execute.
+     style-src stays permissive because author style="" attributes are kept;
+     styles cannot execute.
      */
     private static let contentSecurityPolicyMeta = """
         <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src https: data:; media-src https: data:; font-src https: data:; connect-src 'none'; form-action 'none'; base-uri 'none'; upgrade-insecure-requests">
@@ -408,8 +411,9 @@ final class InAppWebMessageView: BaseMessageView {
             // A link the bootstrap already reported as a click: open it, count nothing.
             guard let raw = args["url"] as? String, let url = URL(string: raw), let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return }
             DispatchQueue.main.async { UIApplication.shared.open(url) }
-        // The rest of the web bridge (BACKLOG C23, 2026-09-26): a message script
-        // that records an event or an attribute used to do nothing here.
+        // The rest of the web bridge (BACKLOG C23, 2026-09-26): a bridge call
+        // (from the injected shim, e.g. a `data-joryio-action` button) that
+        // records an event or an attribute used to do nothing here.
         case "logCustomEvent":
             guard let name = args["name"] as? String, !name.isEmpty else { return }
             Joryio.shared.track(name, properties: (args["properties"] as? [String: Any]) ?? [:])
