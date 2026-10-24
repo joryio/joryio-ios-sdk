@@ -1,0 +1,53 @@
+# Lint for the iOS SDK.
+#
+# Same posture as the web and React Native configs: rules that catch BUGS, not
+# style. Style rules in a codebase that has never been linted produce hundreds
+# of findings and train everyone to ignore the output; the point is that a
+# finding here means something.
+#
+# The rules that matter for a library living inside someone else's app are the
+# crash ones - a force unwrap or force try in an SDK takes the HOST app down,
+# and that is the failure mode this SDK has already shipped once.
+
+included:
+  - Sources
+
+excluded:
+  - .build
+  - Tests
+
+# Style/formatting rules deliberately off: they would bury the crash rules.
+disabled_rules:
+  - line_length
+  - trailing_whitespace
+  - todo
+  - identifier_name
+  - type_name
+  - function_body_length
+  - type_body_length
+  - file_length
+  - cyclomatic_complexity
+  - large_tuple
+  - nesting
+  - trailing_comma
+  - vertical_whitespace
+  - opening_brace
+
+opt_in_rules:
+  # An SDK must never crash its host: these are the ways Swift lets you.
+  - force_unwrapping
+  - empty_count
+  - first_where
+  - last_where
+  - contains_over_filter_count
+  - redundant_nil_coalescing
+  - overridden_super_call
+  # NOT unavailable_function: it flags `required init?(coder:) { fatalError(...) }`,
+  # the standard UIKit boilerplate for a view that is only ever created in code.
+  # That fatalError is unreachable by construction, unlike the ones removed from
+  # initialize(), which a config typo could reach.
+
+# force_cast / force_try are on by default and stay ERRORS: both crash the app.
+force_cast: error
+force_try: error
+force_unwrapping: error
