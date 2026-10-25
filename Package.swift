@@ -39,7 +39,17 @@ let package = Package(
     ],
     dependencies: [
         // SQLite for the offline event queue.
-        .package(url: "https://github.com/stephencelis/SQLite.swift.git", from: "0.15.0"),
+        //
+        // Capped below 0.17.0: SQLite.swift 0.17.0 raised its own minimum to
+        // iOS 15, and SwiftPM refuses a library whose platform minimum is lower
+        // than a dependency's ("the library 'Joryio' requires ios 14.0, but
+        // depends on the product 'SQLite' which requires ios 15.0"). Our own
+        // Package.resolved pins 0.15.4, so this package's tests never saw it -
+        // but an APP resolves the newest allowed version, and every app, the
+        // React Native bridge and the Unity build (which all take this package
+        // since CocoaPods trunk went read-only, D199) would fail. Lift the cap
+        // together with raising `platforms` to iOS 15.
+        .package(url: "https://github.com/stephencelis/SQLite.swift.git", "0.15.0"..<"0.17.0"),
     ],
     targets: [
         .target(

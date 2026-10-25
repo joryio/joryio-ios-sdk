@@ -153,12 +153,20 @@ final class InAppWebMessageView: BaseMessageView {
         case .slideup:
             NSLayoutConstraint.activate([
                 container.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -12),
-                container.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
                 container.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             ])
+            applyWidth(margin: Self.slideupMargin)
             setContentHeight(160)
 
-        case .modal, .custom:
+        case .modal:
+            NSLayoutConstraint.activate([
+                container.centerYAnchor.constraint(equalTo: centerYAnchor),
+                container.centerXAnchor.constraint(equalTo: centerXAnchor),
+            ])
+            applyWidth(margin: Self.modalMargin)
+            setContentHeight(240)
+
+        case .custom:
             NSLayoutConstraint.activate([
                 container.centerYAnchor.constraint(equalTo: centerYAnchor),
                 container.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
@@ -168,13 +176,38 @@ final class InAppWebMessageView: BaseMessageView {
         }
     }
 
-    /// Height tracks the content, driven by the bridge's `setSize`, and is
-    /// capped so a runaway document cannot cover the whole screen in a type
-    /// that is meant to be partial.
+    static let modalMargin: CGFloat = 24
+    static let slideupMargin: CGFloat = 12
+
+    /**
+     Width of a content-sized message: min(maxWidth, screen width - margin on
+     each side), as on web and Android. Expressed as constraints rather than a
+     number so a rotation or an iPad split-view resize re-fits it for free:
+     the width fills the space at high priority and never exceeds maxWidth
+     (required), and the margins are a floor. Before this a modal spanned an
+     iPad edge to edge, whatever the design was authored for.
+     */
+    private func applyWidth(margin: CGFloat) {
+        let maxWidth = CGFloat(campaign.maxWidth ?? 10_000)
+        let fill = container.widthAnchor.constraint(equalTo: widthAnchor, constant: -2 * margin)
+        fill.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            container.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: margin),
+            container.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -margin),
+            container.widthAnchor.constraint(lessThanOrEqualToConstant: maxWidth),
+            fill,
+        ])
+    }
+
+    /// Height tracks the content in BOTH directions, driven by the bridge's
+    /// `setSize`, and is capped so a runaway document cannot cover the whole
+    /// screen in a type that is meant to be partial. Beyond the cap the
+    /// message scrolls inside itself rather than being clipped.
     private func setContentHeight(_ height: CGFloat) {
         guard campaign.type != .fullscreen else { return }
         let cap = UIScreen.main.bounds.height * 0.9
-        let value = min(max(height, 1), cap)
+        let value = CGFloat(InAppSizing.contentHeight(reported: Double(height), cap: Double(cap)))
+        webView?.scrollView.isScrollEnabled = height > cap
 
         if let existing = heightConstraint {
             existing.constant = value
@@ -192,8 +225,11 @@ final class InAppWebMessageView: BaseMessageView {
      `script-src 'none'` is deliberate and stronger than the web SDK's nonce:
      this document contains NO inline script at all - the bridge shim is
      injected as a WKUserScript, which WebKit exempts from the page's CSP. So
-     nothing legitimate needs to execute, and anything that survives the
-     server's sanitiser cannot.
+     nothing legitimate needs to execute, and nothing the author wrote can.
+     The server keeps the markup as written (it drops only <base> and meta
+     refresh), so author script elements, on* handlers and embeds ARE in this
+     document - this CSP is what stops them, not a backstop behind a server
+     sanitiser. Buttons and forms work through the injected bridge.
 
      The media directives are the mixed-content control Android enforced with
      MIXED_CONTENT_NEVER_ALLOW and iOS had no equivalent for: an origin-less
@@ -201,8 +237,8 @@ final class InAppWebMessageView: BaseMessageView {
      stated. `upgrade-insecure-requests` upgrades an author's http image rather
      than simply breaking it.
 
-     style-src stays permissive because the server's sanitiser ALLOWS style=""
-     attributes; styles cannot execute.
+     style-src stays permissive because author style="" attributes are kept;
+     styles cannot execute.
      */
     private static let contentSecurityPolicyMeta = """
         <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src https: data:; media-src https: data:; font-src https: data:; connect-src 'none'; form-action 'none'; base-uri 'none'; upgrade-insecure-requests">
@@ -219,6 +255,10 @@ final class InAppWebMessageView: BaseMessageView {
         <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
         <style>
           html,body{margin:0;padding:0;background:transparent;}
+          /* Partial types: the body is a normal block at the view's width and
+             flow-root keeps its children's margins inside it, so its height
+             IS the content's height - see report() below. */
+          \(campaign.type == .fullscreen ? "" : "body{display:flow-root;}")
           /* Responsive by default: an authored image keeps its intrinsic size
              otherwise, so anything wider than the device overflows and the
              message can be scrolled sideways. Declared BEFORE the author
@@ -370,12 +410,16 @@ final class InAppWebMessageView: BaseMessageView {
             });
           }, true);
 
+          // The BODY's height, not the root's: the root's scrollHeight is never
+          // below the web view's own height, so measuring it let a message grow
+          // and never shrink - a modal started at 240pt stayed at least 240pt,
+          // and a form replaced by its thank-you line kept the form's height.
+          // Same measure as the web SDK.
           function report() {
             try {
-              var h = Math.max(
-                document.body ? document.body.scrollHeight : 0,
-                document.documentElement ? document.documentElement.scrollHeight : 0
-              );
+              var b = document.body;
+              if (!b) return;
+              var h = Math.ceil(Math.max(b.scrollHeight, b.getBoundingClientRect().height));
               if (h > 0) post('setSize', {height: h});
             } catch (e) {}
           }
@@ -408,8 +452,9 @@ final class InAppWebMessageView: BaseMessageView {
             // A link the bootstrap already reported as a click: open it, count nothing.
             guard let raw = args["url"] as? String, let url = URL(string: raw), let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return }
             DispatchQueue.main.async { UIApplication.shared.open(url) }
-        // The rest of the web bridge (BACKLOG C23, 2026-09-26): a message script
-        // that records an event or an attribute used to do nothing here.
+        // The rest of the web bridge (BACKLOG C23, 2026-09-26): a bridge call
+        // (from the injected shim, e.g. a `data-joryio-action` button) that
+        // records an event or an attribute used to do nothing here.
         case "logCustomEvent":
             guard let name = args["name"] as? String, !name.isEmpty else { return }
             Joryio.shared.track(name, properties: (args["properties"] as? [String: Any]) ?? [:])
