@@ -422,6 +422,11 @@ public class Joryio {
     private static var pendingAuthHandler: ((SdkAuthError) -> Void)?
     private static var pendingConsent: JoryioConfig.TrackingConsent?
     private static var pendingInAppCallback: (callback: (InAppCampaign) -> Void, capabilities: [String]?)?
+    /// clearInAppMessageCallback() was called before init (and no callback
+    /// after it): applied at init, so it also ends a
+    /// `holdInAppMessagesForHandler` hold - a launch whose initialize() is
+    /// deferred to the first unlock would otherwise hold for the whole run.
+    private static var pendingInAppCallbackCleared = false
 
     private static func withPreInit<T>(_ body: () -> T) -> T {
         preInitLock.lock()
@@ -701,7 +706,8 @@ public class Joryio {
                 onMessageDisplay: inAppConfig.onMessageDisplay,
                 onMessageClick: inAppConfig.onMessageClick,
                 onMessageDismiss: inAppConfig.onMessageDismiss
-            )
+            ),
+            holdInAppMessagesForHandler: inAppConfig.holdInAppMessagesForHandler
         )
         self.pushNotifications = PushNotificationManager(
             networkClient: network,
@@ -845,12 +851,15 @@ public class Joryio {
         // An in-app callback set before init.
         if let pending = Self.withPreInit({ Self.pendingInAppCallback }) {
             setInAppMessageCallback(pending.callback, capabilities: pending.capabilities)
+        } else if Self.withPreInit({ Self.pendingInAppCallbackCleared }) {
+            clearInAppMessageCallback()
         }
         Self.withPreInit {
             Self.pendingAuthToken = nil
             Self.pendingAuthHandler = nil
             Self.pendingConsent = nil
             Self.pendingInAppCallback = nil
+            Self.pendingInAppCallbackCleared = false
         }
 
         // Report the permission state now the SDK is live.
@@ -2458,17 +2467,21 @@ public class Joryio {
         capabilities: [String]? = nil
     ) {
         guard isInitialized else {
-            Self.withPreInit { Self.pendingInAppCallback = (callback, capabilities) }
+            Self.withPreInit {
+                Self.pendingInAppCallback = (callback, capabilities)
+                Self.pendingInAppCallbackCleared = false
+            }
             return
         }
-        inAppMessaging.hostCapabilities = capabilities
         // Wrapped to count handoffs, so the SDK can say something when a host
-        // takes messages and reports none of them. Matches Android.
-        inAppMessaging.onMessageReady = { [weak self] campaign in
+        // takes messages and reports none of them. Matches Android. A message
+        // held for this callback (`InAppConfig.holdInAppMessagesForHandler`)
+        // is handed to it now.
+        inAppMessaging.setHostRenderer({ [weak self] campaign in
             if let self { self.locked { self._inAppHandedOff += 1 } }
             callback(campaign)
             self?.warnIfInAppNeverReported()
-        }
+        }, capabilities: capabilities)
     }
 
     /// Hand in-app display back to the SDK: removes the callback set with
@@ -2478,7 +2491,10 @@ public class Joryio {
     /// slot. Safe before `initialize()`.
     public func clearInAppMessageCallback() {
         guard isInitialized else {
-            Self.withPreInit { Self.pendingInAppCallback = nil }
+            Self.withPreInit {
+                Self.pendingInAppCallback = nil
+                Self.pendingInAppCallbackCleared = true
+            }
             return
         }
         inAppMessaging.clearHostRenderer()

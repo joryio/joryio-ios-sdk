@@ -1,7 +1,7 @@
 import Foundation
 
 /// SDK version
-public let SDK_VERSION = "1.3.1"
+public let SDK_VERSION = "1.3.2"
 
 /// Default configuration constants
 public struct ConfigDefaults {
@@ -59,6 +59,25 @@ public struct InAppConfig {
     /// identify, reset, a watched attribute, a push tap - are not throttled.
     public let syncInterval: TimeInterval
 
+    /// Your app draws in-app messages itself and will call
+    /// `Joryio.shared.setInAppMessageCallback` AFTER `initialize()`: until it
+    /// does, the SDK draws nothing. Off by default.
+    ///
+    /// Without it there is a window between `initialize()` and your callback
+    /// in which the first sync can finish and the SDK draws a message with its
+    /// own views - the one message your app meant to draw. With it, a message
+    /// that is ready before your callback is set is HELD: not drawn, not
+    /// reported, nothing spent. It is handed to your callback the moment you
+    /// set it. Calling `clearInAppMessageCallback()` instead ends the hold and
+    /// the SDK draws the held message itself.
+    ///
+    /// The hold covers only the time before the first set or clear. After
+    /// that, clearing the callback hands rendering back to the SDK as always.
+    /// Same option, same name, on Android (`JoryioConfig`), React Native and
+    /// Unity. A callback set BEFORE `initialize()` needs no hold: it is
+    /// installed before the first sync.
+    public let holdInAppMessagesForHandler: Bool
+
     /// Called on the main thread after the SDK displays a message.
     public let onMessageDisplay: ((InAppMessage) -> Void)?
     /// Called on the main thread when a button or link in a message is tapped,
@@ -73,9 +92,11 @@ public struct InAppConfig {
         syncInterval: TimeInterval = InAppConfig.defaultSyncInterval,
         onMessageDisplay: ((InAppMessage) -> Void)? = nil,
         onMessageClick: ((InAppMessage, String) -> Void)? = nil,
-        onMessageDismiss: ((InAppMessage) -> Void)? = nil
+        onMessageDismiss: ((InAppMessage) -> Void)? = nil,
+        holdInAppMessagesForHandler: Bool = false
     ) {
         self.enabled = enabled
+        self.holdInAppMessagesForHandler = holdInAppMessagesForHandler
         self.allowHtmlJsInAppMessages = allowHtmlJsInAppMessages
         self.syncInterval = syncInterval
         self.onMessageDisplay = onMessageDisplay

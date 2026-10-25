@@ -64,6 +64,26 @@ class InAppMessagingManager {
     /// One per hand-off, so a fallback timer can only release the hand-off
     /// it was started for.
     private var hostHoldToken = 0
+    /// `InAppConfig.holdInAppMessagesForHandler`: true from initialize() until
+    /// the host first sets or clears its renderer. While true, a message that
+    /// is ready is parked in `heldForHandler` instead of being drawn.
+    private var holdingForHandler: Bool
+    /// The message parked by the hold. It keeps the display slot (one message
+    /// at a time, as on every route); nothing is spent or reported until it
+    /// is handed to the host renderer or, after a clear, drawn by the SDK.
+    private var heldForHandler: HeldForHandler?
+    /// A parked message and WHO it was chosen for: delivered only to that same
+    /// person (anonymous id and user id unchanged) and only while fresh. Every
+    /// identity, opt-out and consent change also drops it outright
+    /// (`invalidate()`, `clear()`); this is the second line of defence.
+    private struct HeldForHandler {
+        let campaign: InAppCampaign
+        let generation: Int
+        let epoch: Int
+        let anonymousId: String
+        let userId: String?
+        let heldAt: Date
+    }
     /// A forced sync was asked for while one was in flight. That request
     /// used to be skipped, so the in-flight (stale) answer won; it now runs
     /// right after.
@@ -113,8 +133,10 @@ class InAppMessagingManager {
         allowHtmlJsInAppMessages: Bool = false,
         enabled: Bool = true,
         syncInterval: TimeInterval = InAppConfig.defaultSyncInterval,
-        callbacks: InAppCallbacks = InAppCallbacks()
+        callbacks: InAppCallbacks = InAppCallbacks(),
+        holdInAppMessagesForHandler: Bool = false
     ) {
+        self.holdingForHandler = holdInAppMessagesForHandler
         self.networkClient = networkClient
         self.storage = storage
         self.identityManager = identityManager
@@ -193,6 +215,12 @@ class InAppMessagingManager {
         withState {
             syncEpoch += 1
             displayEpoch += 1
+            // A message parked for the host was chosen for the previous
+            // identity or decision: dropped, and its slot freed.
+            if let held = heldForHandler {
+                heldForHandler = nil
+                releaseSlotLocked(campaignId: held.campaign.id, generation: held.generation)
+            }
         }
     }
 
@@ -334,7 +362,11 @@ class InAppMessagingManager {
         // RENDER FIRST, then report. An impression means the view was actually
         // put on screen (or handed to the host that draws it).
         let outcome = await presentCampaign(campaign, generation: claimGeneration, displayEpoch: claimEpoch)
+        await finishPresentation(outcome, campaign: campaign, generation: claimGeneration)
+    }
 
+    /// What follows a presentation attempt, whichever route made it.
+    private func finishPresentation(_ outcome: PresentOutcome, campaign: InAppCampaign, generation claimGeneration: Int) async {
         switch outcome {
         case .presentedBySDK(let shown):
             // The SDK drew it, so the SDK reports it - and spends the budget.
@@ -347,6 +379,13 @@ class InAppMessagingManager {
             // The HOST reports `displayed` through trackInAppImpression, and
             // that report is what spends the budget. The SDK used to send its
             // own as well, so every host-rendered message counted twice.
+            break
+
+        case .heldForHandler:
+            // Parked for the host renderer the app said it will set
+            // (holdInAppMessagesForHandler). It keeps the slot; nothing is
+            // spent until the host reports it, or the SDK draws it after a
+            // clear.
             break
 
         case .notShown:
@@ -476,6 +515,7 @@ class InAppMessagingManager {
     enum PresentOutcome {
         case presentedBySDK(InAppCampaign)
         case handedToHost
+        case heldForHandler
         case notShown
     }
 
@@ -525,25 +565,16 @@ class InAppMessagingManager {
             campaign = resolved
         }
 
-        let hostRenderer = withState { onMessageReadyHandler }
-
         // HTML runs in this SDK's web view only when the integration opted in.
         // THE FLAG IS ABOUT THIS SDK'S WEB VIEW, so it applies only when THIS
-        // SDK is going to draw: with a host renderer set, the host decides what
-        // it can draw (and declared it in hostCapabilities). Android passes the
-        // flag into its presenter and never gates the handoff; this matches.
-        let onMessageReady = hostRenderer
-        if onMessageReady == nil {
-            var isHtml = true
-            if case .native = campaign.content { isHtml = false }
-            if isHtml && !allowHtmlJsInAppMessages {
-                logger.warn(
-                    "Campaign \(campaign.id) is an HTML in-app message, but "
-                        + "InAppConfig.allowHtmlJsInAppMessages is false and no host "
-                        + "renderer is set - not displaying it."
-                )
-                return .notShown
-            }
+        // SDK is going to draw: with a host renderer set - or one on its way
+        // (holdInAppMessagesForHandler) - the host decides what it can draw
+        // (and declared it in hostCapabilities). Android passes the flag into
+        // its presenter and never gates the handoff; this matches. Checked
+        // here, before the display delay, and again by drawWithSDK.
+        let sdkWillDraw = withState { onMessageReadyHandler == nil && !holdingForHandler }
+        if sdkWillDraw, !sdkMayDraw(campaign) {
+            return .notShown
         }
 
         // Display delay, in SECONDS: applied after every eligibility gate and
@@ -569,20 +600,73 @@ class InAppMessagingManager {
             return .notShown
         }
 
-        // A host callback wins; the SDK must not also draw the message.
-        if let onMessageReady {
-            // Bookkeeping BEFORE host code runs (SDK contract 34): whatever the
-            // host's callback does, the slot is released by the fallback.
-            let holdToken: Int = withState {
-                hostHeldCampaignId = campaign.id
-                hostReportedDisplayed = false
-                hostHoldToken += 1
-                return hostHoldToken
+        // Who draws it, decided in ONE locked read: a host callback wins (the
+        // SDK must not also draw the message); with none set yet and the app
+        // having said it will set one (holdInAppMessagesForHandler), the
+        // message is parked for it; otherwise the SDK draws. The callback is
+        // read HERE rather than before the display delay, so one set during
+        // the delay is honoured.
+        enum Route { case host((InAppCampaign) -> Void), hold, sdk }
+        // Read outside the state lock (IdentityManager has its own).
+        let heldAnonymousId = identityManager.getAnonymousId()
+        let heldUserId = identityManager.getUserId()
+        let route: Route = withState {
+            if let handler = onMessageReadyHandler { return .host(handler) }
+            if holdingForHandler {
+                heldForHandler = HeldForHandler(
+                    campaign: campaign, generation: claimGeneration, epoch: claimEpoch,
+                    anonymousId: heldAnonymousId, userId: heldUserId, heldAt: Date()
+                )
+                return .hold
             }
-            scheduleHostReleaseFallback(campaignId: campaign.id, generation: claimGeneration, holdToken: holdToken)
-            onMessageReady(campaign)
-            return .handedToHost
+            return .sdk
         }
+        switch route {
+        case .host(let handler):
+            return handOffToHost(campaign, handler: handler, generation: claimGeneration)
+        case .hold:
+            logger.info("Holding in-app message \(campaign.id) until your app sets its in-app callback (holdInAppMessagesForHandler)")
+            return .heldForHandler
+        case .sdk:
+            return drawWithSDK(campaign)
+        }
+    }
+
+    /// Hand `campaign` to the host renderer. Bookkeeping BEFORE host code runs
+    /// (SDK contract 34): whatever the host's callback does, the slot is
+    /// released by the fallback.
+    @MainActor
+    private func handOffToHost(_ campaign: InAppCampaign, handler: (InAppCampaign) -> Void, generation claimGeneration: Int) -> PresentOutcome {
+        let holdToken: Int = withState {
+            hostHeldCampaignId = campaign.id
+            hostReportedDisplayed = false
+            hostHoldToken += 1
+            return hostHoldToken
+        }
+        scheduleHostReleaseFallback(campaignId: campaign.id, generation: claimGeneration, holdToken: holdToken)
+        handler(campaign)
+        return .handedToHost
+    }
+
+    /// The HTML gate for the SDK's OWN renderer; logs when it refuses.
+    private func sdkMayDraw(_ campaign: InAppCampaign) -> Bool {
+        var isHtml = true
+        if case .native = campaign.content { isHtml = false }
+        if isHtml && !allowHtmlJsInAppMessages {
+            logger.warn(
+                "Campaign \(campaign.id) is an HTML in-app message, but "
+                    + "InAppConfig.allowHtmlJsInAppMessages is false and no host "
+                    + "renderer is set - not displaying it."
+            )
+            return false
+        }
+        return true
+    }
+
+    /// Draw `campaign` with the SDK's own renderer (JoryioUI).
+    @MainActor
+    private func drawWithSDK(_ campaign: InAppCampaign) -> PresentOutcome {
+        guard sdkMayDraw(campaign) else { return .notShown }
 
         // Pick the window the user is actually LOOKING AT. A React Native app
         // has several UIWindows, and `.first` frequently returns one that is
@@ -715,7 +799,7 @@ class InAppMessagingManager {
     /// The host stops rendering: the SDK's own renderer takes over again, and
     /// a message the host held no longer occupies the display slot.
     func clearHostRenderer() {
-        withState {
+        let parked = withState { () -> HeldForHandler? in
             onMessageReadyHandler = nil
             _hostCapabilities = nil
             if let held = hostHeldCampaignId {
@@ -723,8 +807,66 @@ class InAppMessagingManager {
                 hostReportedDisplayed = false
                 releaseSlotLocked(campaignId: held, generation: generation)
             }
+            // The app said it is not drawing: the hold ends, and a message
+            // parked for a callback is drawn by the SDK instead of lost.
+            holdingForHandler = false
+            defer { heldForHandler = nil }
+            return heldForHandler
+        }
+        if let parked {
+            Task { @MainActor [weak self] in await self?.releaseParked(parked, toHost: nil) }
         }
     }
+
+    /// Install the host renderer (Joryio.setInAppMessageCallback). Ends the
+    /// hold: a message parked for this renderer is handed to it now.
+    func setHostRenderer(_ handler: @escaping (InAppCampaign) -> Void, capabilities: [String]?) {
+        let parked = withState { () -> HeldForHandler? in
+            onMessageReadyHandler = handler
+            _hostCapabilities = capabilities
+            holdingForHandler = false
+            defer { heldForHandler = nil }
+            return heldForHandler
+        }
+        if let parked {
+            logger.info("Handing held in-app message \(parked.campaign.id) to your callback")
+            Task { @MainActor [weak self] in await self?.releaseParked(parked, toHost: handler) }
+        }
+    }
+
+    /// A parked message leaves the hold: to the host renderer when one was
+    /// set, otherwise drawn by the SDK. Not shown at all - and its slot freed -
+    /// when the person, a decision or sending changed while it waited.
+    @MainActor
+    private func releaseParked(
+        _ parked: HeldForHandler,
+        toHost handler: ((InAppCampaign) -> Void)?
+    ) async {
+        let current = withState {
+            generation == parked.generation && displayEpoch == parked.epoch
+                && slotCampaignId == parked.campaign.id
+        }
+        // Chosen for this same person, and not stale: never handed to, or
+        // drawn for, someone else.
+        let samePerson = identityManager.getAnonymousId() == parked.anonymousId
+            && identityManager.getUserId() == parked.userId
+        let fresh = Date().timeIntervalSince(parked.heldAt) < Self.hostDisplayedTimeoutSeconds
+        guard current, samePerson, fresh, canSync() else {
+            logger.debug("Dropping held in-app message \(parked.campaign.id): chosen for another identity or decision, or expired")
+            withState { releaseSlotLocked(campaignId: parked.campaign.id, generation: parked.generation) }
+            return
+        }
+        let outcome: PresentOutcome
+        if let handler {
+            outcome = handOffToHost(parked.campaign, handler: handler, generation: parked.generation)
+        } else {
+            outcome = drawWithSDK(parked.campaign)
+        }
+        await finishPresentation(outcome, campaign: parked.campaign, generation: parked.generation)
+    }
+
+    /// Diagnostics for tests: the id parked by holdInAppMessagesForHandler.
+    var heldForHandlerIdForTesting: String? { withState { heldForHandler?.campaign.id } }
 
     /// Public entry point for a host that rendered the message itself.
     /// - Parameter elementId: which button or link, for a click.
@@ -927,6 +1069,9 @@ class InAppMessagingManager {
             isDisplaying = false
             slotCampaignId = nil
             hostHeldCampaignId = nil
+            // A parked message was the previous person's. The hold itself
+            // stays: the app has still not set its callback.
+            heldForHandler = nil
             lastDisplayTime = nil
             lastSyncTime = nil
             watchedAttributes = []
