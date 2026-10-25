@@ -1,7 +1,7 @@
 Pod::Spec.new do |s|
   s.name             = 'Joryio'
   # Keep in sync with the other SDKs - sdk-version-parity.spec.ts pins it.
-  s.version          = '1.3.1'
+  s.version          = '1.3.2'
   s.summary          = 'Joryio iOS SDK - identify, track, push, and in-app messaging.'
   s.description      = <<-DESC
     Official Joryio SDK for iOS: user identification, event tracking with
