@@ -189,6 +189,24 @@ public struct InAppCampaign: Codable {
         }
     }
 
+    /**
+     The widest this HTML message may be, in points, or nil when its type is
+     not content-sized (banner, fullscreen, custom) or its content is native.
+
+     The server sends the resolved value as `content.maxWidth`; a payload that
+     predates the field gets the same per-type default every SDK uses
+     (`InAppSizing.defaultMaxWidth`). The renderer gives the message
+     min(maxWidth, screen width - its margins), so a design authored at 680
+     stays 680 on an iPad instead of stretching edge to edge, and fits the
+     screen on a phone.
+     */
+    public var maxWidth: Double? {
+        guard type == .modal || type == .slideup,
+              let c = contentPayload, c.kind == "html" else { return nil }
+        if let mw = c.maxWidth, mw.isFinite, mw > 0 { return mw.rounded(.down) }
+        return InAppSizing.defaultMaxWidth(for: type)
+    }
+
     public enum MessageType: String, Codable {
         case modal
         case banner
@@ -215,6 +233,9 @@ public struct InAppCampaign: Codable {
         // kind = "html"
         public let html: String?
         public let css: String?
+        /// Widest the message may be, in points. Sent for `modal` and
+        /// `slideup`; read through `InAppCampaign.maxWidth`.
+        public let maxWidth: Double?
 
         // kind = "native"
         public let title: String?
@@ -242,6 +263,7 @@ public struct InAppCampaign: Codable {
             kind = (try? c.decode(String.self, forKey: .kind)) ?? ""
             html = try? c.decode(String.self, forKey: .html)
             css = try? c.decode(String.self, forKey: .css)
+            maxWidth = try? c.decode(Double.self, forKey: .maxWidth)
             title = try? c.decode(String.self, forKey: .title)
             body = try? c.decode(String.self, forKey: .body)
             imageUrl = try? c.decode(String.self, forKey: .imageUrl)
@@ -252,7 +274,7 @@ public struct InAppCampaign: Codable {
         }
 
         enum CodingKeys: String, CodingKey {
-            case kind, html, css, title, body, imageUrl, buttons, closeButton, backdropDismissible, style
+            case kind, html, css, maxWidth, title, body, imageUrl, buttons, closeButton, backdropDismissible, style
         }
     }
 
@@ -677,5 +699,33 @@ public struct InAppFormSubmitResponse: Codable {
         self.message = message
         self.redirect = redirect
         self.errors = errors
+    }
+}
+
+
+/**
+ Sizing of content-sized (modal / slideup) HTML messages. The same numbers as
+ the backend contract (`IN_APP_DEFAULT_MAX_WIDTH`) and every other SDK.
+ */
+public enum InAppSizing {
+    /// Fallback when the payload carries no `maxWidth`: modal 600, slideup 400.
+    public static func defaultMaxWidth(for type: InAppCampaign.MessageType) -> Double? {
+        switch type {
+        case .modal: return 600
+        case .slideup: return 400
+        default: return nil
+        }
+    }
+
+    /// The height a partial (non-fullscreen) HTML message is given: what the
+    /// content reported, at least 1pt, at most `cap`. Follows the content
+    /// down as well as up.
+    public static func contentHeight(reported: Double, cap: Double) -> Double {
+        min(max(reported, 1), cap)
+    }
+
+    /// min(maxWidth, available - margin on each side), never negative.
+    public static func frameWidth(maxWidth: Double, available: Double, margin: Double) -> Double {
+        max(0, min(maxWidth, available - 2 * margin))
     }
 }
