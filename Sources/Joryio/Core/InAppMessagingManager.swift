@@ -64,6 +64,44 @@ class InAppMessagingManager {
     /// One per hand-off, so a fallback timer can only release the hand-off
     /// it was started for.
     private var hostHoldToken = 0
+
+    // MARK: Display dwell (InAppDisplay.IN_APP_DISPLAY_DWELL_MS)
+
+    /// A message the SDK drew, and whether it has COUNTED as displayed yet.
+    private struct DrawnMessage {
+        let campaign: InAppCampaign
+        var counted: Bool
+    }
+    /// SDK-drawn messages on screen. One reaches `counted` only after it was
+    /// on screen for the dwell while the app was active, or the person
+    /// clicked or dismissed it - never merely because it was put on screen.
+    private var sdkDrawn: [String: DrawnMessage] = [:]
+    /// Drawn messages that were dropped (reset, identity, opt-out or consent
+    /// change) before they counted: their later dismissal reports nothing.
+    private var removedUnseen: Set<String> = []
+    /// One per dwell timer start; a timer waking to a different value does
+    /// nothing. Bumped when the app resigns active, so leaving the app before
+    /// the dwell never counts.
+    private var dwellToken = 0
+    /// The window the SDK drew into, to tell whether the message is still up.
+    private weak var drawnWindow: UIWindow?
+    /// A campaign not drawn because the screen never settled: tried again when
+    /// the app next becomes active.
+    private var deferredForStability: String?
+    private var lifecycleObservers: [NSObjectProtocol] = []
+
+    /// Dwell length in seconds. A seam for tests; the rule is the constant.
+    var displayDwellSeconds: TimeInterval = Double(InAppDisplay.IN_APP_DISPLAY_DWELL_MS) / 1000
+    /// How long to wait for the screen to settle before giving up (the
+    /// campaign stays eligible), and how often to look.
+    var hostStableTimeoutSeconds: TimeInterval = 10
+    var hostStablePollSeconds: TimeInterval = 0.25
+    /// Test seams: replace the UIKit probes.
+    var appActiveOverrideForTesting: (() -> Bool)?
+    var hostStableOverrideForTesting: (() -> Bool)?
+    var messageOnScreenOverrideForTesting: (() -> Bool)?
+    /// Test seam: stands in for window + presenter. Returns whether it drew.
+    var drawOverrideForTesting: ((InAppCampaign) -> Bool)?
     /// `InAppConfig.holdInAppMessagesForHandler`: true from initialize() until
     /// the host first sets or clears its renderer. While true, a message that
     /// is ready is parked in `heldForHandler` instead of being drawn.
@@ -148,6 +186,41 @@ class InAppMessagingManager {
         self.callbacks = callbacks
 
         loadCachedData()
+        observeAppLifecycle()
+    }
+
+    deinit {
+        lifecycleObservers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
+    /// Leaving the app stops a dwell; coming back starts it again from zero
+    /// for a message still on screen, and retries one that never got a
+    /// settled screen.
+    private func observeAppLifecycle() {
+        let center = NotificationCenter.default
+        for name in [UIApplication.willResignActiveNotification, UIApplication.didEnterBackgroundNotification] {
+            lifecycleObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.appLeftForeground()
+            })
+        }
+        lifecycleObservers.append(center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.appBecameActive()
+        })
+    }
+
+    func appLeftForeground() {
+        withState { dwellToken += 1 }
+    }
+
+    func appBecameActive() {
+        startDwell()
+        let deferred = withState { () -> String? in
+            defer { deferredForStability = nil }
+            return deferredForStability
+        }
+        if let deferred {
+            Task { [weak self] in await self?.displayFirstEligible(from: { $0.id == deferred }) }
+        }
     }
 
     // MARK: - Campaign Sync
@@ -215,6 +288,7 @@ class InAppMessagingManager {
         withState {
             syncEpoch += 1
             displayEpoch += 1
+            dropUncountedLocked()
             // A message parked for the host was chosen for the previous
             // identity or decision: dropped, and its slot freed.
             if let held = heldForHandler {
@@ -369,11 +443,18 @@ class InAppMessagingManager {
     private func finishPresentation(_ outcome: PresentOutcome, campaign: InAppCampaign, generation claimGeneration: Int) async {
         switch outcome {
         case .presentedBySDK(let shown):
-            // The SDK drew it, so the SDK reports it - and spends the budget.
-            // Exactly one `displayed`.
-            withState { recordDisplayedLocked(campaignId: campaign.id) }
-            await trackImpression(campaignId: shown.id, kind: .display)
-            fireCallback { $0.onMessageDisplay?(shown) }
+            // The SDK drew it, so the SDK reports it - and spends the budget -
+            // but only once it COUNTS: on screen for IN_APP_DISPLAY_DWELL_MS
+            // while the app stayed active, or clicked / dismissed sooner. A
+            // message gone before that (the app left, a reset) reports nothing
+            // and spends nothing, so it can show again. Reporting at draw time
+            // counted messages that flashed during a screen change and used up
+            // the cap (prod, 2026-11-02/03).
+            withState {
+                sdkDrawn[shown.id] = DrawnMessage(campaign: shown, counted: false)
+                removedUnseen.remove(shown.id)
+            }
+            startDwell()
 
         case .handedToHost:
             // The HOST reports `displayed` through trackInAppImpression, and
@@ -628,7 +709,173 @@ class InAppMessagingManager {
             logger.info("Holding in-app message \(campaign.id) until your app sets its in-app callback (holdInAppMessagesForHandler)")
             return .heldForHandler
         case .sdk:
+            // Only onto a settled screen: app active, the top view controller
+            // in a window and not mid-presentation, dismissal or push/pop.
+            guard await waitForStableHost(campaign, generation: claimGeneration, displayEpoch: claimEpoch) else {
+                return .notShown
+            }
+            // A host renderer set while we waited wins.
+            if let handler = withState({ onMessageReadyHandler }) {
+                return handOffToHost(campaign, handler: handler, generation: claimGeneration)
+            }
             return drawWithSDK(campaign)
+        }
+    }
+
+    /// Wait (bounded) for a settled screen. False when it never settled -
+    /// nothing drawn, nothing spent, and the campaign is retried when the app
+    /// next becomes active - or when the person or decision changed meanwhile.
+    @MainActor
+    private func waitForStableHost(_ campaign: InAppCampaign, generation claimGeneration: Int, displayEpoch claimEpoch: Int) async -> Bool {
+        let deadline = Date().addingTimeInterval(hostStableTimeoutSeconds)
+        while !hostIsStable() {
+            guard Date() < deadline else {
+                logger.info("Campaign \(campaign.id) not shown: the screen did not settle (app inactive or mid-transition). Nothing counted; it stays eligible.")
+                // Nothing was displayed, so the gap between messages does not
+                // start: the retry must not be refused as "too soon".
+                withState {
+                    deferredForStability = campaign.id
+                    lastDisplayTime = nil
+                }
+                return false
+            }
+            try? await Task.sleep(nanoseconds: Self.nanoseconds(seconds: hostStablePollSeconds))
+            let current = withState { generation == claimGeneration && displayEpoch == claimEpoch }
+            guard !Task.isCancelled, current, canSync() else { return false }
+        }
+        return true
+    }
+
+    @MainActor
+    private func hostIsStable() -> Bool {
+        if let override = hostStableOverrideForTesting { return override() }
+        // No window at all: nothing to wait for - drawWithSDK refuses at once,
+        // as it always has, rather than after the settle timeout.
+        guard let window = Self.currentWindow() else { return true }
+        return Self.hostIsStable(window: window, appActive: appIsActive())
+    }
+
+    @MainActor
+    private func appIsActive() -> Bool {
+        if let override = appActiveOverrideForTesting { return override() }
+        return UIApplication.shared.applicationState == .active
+    }
+
+    /**
+     Is the screen settled enough to put a message on? The app is active, the
+     window is visible, and the top view controller is in that window and not
+     being presented, dismissed, pushed or popped. A message drawn during a
+     transition is the one the person never sees: the screen it sat on is
+     going away.
+     */
+    @MainActor
+    static func hostIsStable(window: UIWindow?, appActive: Bool) -> Bool {
+        guard appActive, let window, !window.isHidden else { return false }
+        guard let top = topViewController(from: window.rootViewController) else { return true }
+        guard top.viewIfLoaded?.window != nil else { return false }
+        if top.isBeingPresented || top.isBeingDismissed || top.isMovingToParent || top.isMovingFromParent {
+            return false
+        }
+        return top.transitionCoordinator == nil
+    }
+
+    @MainActor
+    static func topViewController(from root: UIViewController?) -> UIViewController? {
+        var current = root
+        while let vc = current {
+            if let presented = vc.presentedViewController {
+                current = presented
+            } else if let nav = vc as? UINavigationController, let visible = nav.visibleViewController ?? nav.topViewController {
+                if visible === nav { return nav }
+                current = visible
+            } else if let tabs = vc as? UITabBarController, let selected = tabs.selectedViewController {
+                current = selected
+            } else {
+                return vc
+            }
+        }
+        return nil
+    }
+
+    /// The window the user is actually LOOKING AT. A React Native app has
+    /// several UIWindows, and `.first` frequently returns one that is not on
+    /// screen (2026-08-12).
+    @MainActor
+    static func currentWindow() -> UIWindow? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+        return scene?.windows.first { $0.isKeyWindow }
+            ?? scene?.windows.first { !$0.isHidden && $0.alpha > 0 }
+            ?? scene?.windows.first
+    }
+
+    // MARK: - Display dwell
+
+    /// Start (or restart) the dwell for every drawn message not yet counted.
+    private func startDwell() {
+        let (token, pending, seconds) = withState { () -> (Int, Bool, TimeInterval) in
+            dwellToken += 1
+            return (dwellToken, sdkDrawn.values.contains { !$0.counted }, displayDwellSeconds)
+        }
+        guard pending else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.nanoseconds(seconds: seconds))
+            await self?.dwellElapsed(token: token)
+        }
+    }
+
+    @MainActor
+    private func dwellElapsed(token: Int) async {
+        guard withState({ dwellToken == token }) else { return }
+        // Still active and still up for the whole dwell. If not, nothing
+        // counts; coming back to the app restarts the dwell.
+        guard appIsActive(), messageIsOnScreen() else {
+            logger.debug("In-app dwell ended without the message on screen; not counted")
+            return
+        }
+        let uncounted = withState { sdkDrawn.filter { !$0.value.counted }.map(\.key) }
+        for id in uncounted {
+            await countAsDisplayed(id)
+        }
+    }
+
+    @MainActor
+    private func messageIsOnScreen() -> Bool {
+        if let override = messageOnScreenOverrideForTesting { return override() }
+        guard let window = drawnWindow else { return false }
+        return !window.isHidden && window.windowScene?.activationState == .foregroundActive
+    }
+
+    /// The message counts as displayed: spend the budget and the show-once
+    /// record, report `displayed`, fire onMessageDisplay. Once per drawing;
+    /// a no-op for a message that already counted or is not the SDK's.
+    private func countAsDisplayed(_ campaignId: String) async {
+        let shown: InAppCampaign? = withState {
+            guard var drawn = sdkDrawn[campaignId], !drawn.counted else { return nil }
+            drawn.counted = true
+            sdkDrawn[campaignId] = drawn
+            recordDisplayedLocked(campaignId: campaignId)
+            return drawn.campaign
+        }
+        guard let shown else { return }
+        await trackImpression(campaignId: campaignId, kind: .display)
+        fireCallback { $0.onMessageDisplay?(shown) }
+    }
+
+    /// The person acted on a message the SDK drew (a form submit): if it
+    /// has not counted yet, it counts now. A no-op for any other message.
+    func noteInteraction(campaignId: String) async {
+        await countAsDisplayed(campaignId)
+    }
+
+    /// Drawn messages that have not counted are forgotten: the person they
+    /// were drawn for, or the decision to show them, changed. Their dismissal
+    /// reports nothing. Caller MUST hold `stateLock`.
+    private func dropUncountedLocked() {
+        dwellToken += 1
+        for (id, drawn) in sdkDrawn where !drawn.counted {
+            sdkDrawn[id] = nil
+            removedUnseen.insert(id)
         }
     }
 
@@ -668,16 +915,12 @@ class InAppMessagingManager {
     private func drawWithSDK(_ campaign: InAppCampaign) -> PresentOutcome {
         guard sdkMayDraw(campaign) else { return .notShown }
 
-        // Pick the window the user is actually LOOKING AT. A React Native app
-        // has several UIWindows, and `.first` frequently returns one that is
-        // not on screen (2026-08-12). Only the SDK's own renderer needs one.
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
-        let window = scene?.windows.first { $0.isKeyWindow }
-            ?? scene?.windows.first { !$0.isHidden && $0.alpha > 0 }
-            ?? scene?.windows.first
+        if let draw = drawOverrideForTesting {
+            return draw(campaign) ? .presentedBySDK(campaign) : .notShown
+        }
 
-        guard let window else {
+        // Only the SDK's own renderer needs a window.
+        guard let window = Self.currentWindow() else {
             logger.error("No window available to display campaign")
             return .notShown
         }
@@ -693,6 +936,7 @@ class InAppMessagingManager {
             return .notShown
         }
 
+        withState { drawnWindow = window }
         return .presentedBySDK(campaign)
     }
 
@@ -859,8 +1103,10 @@ class InAppMessagingManager {
         let outcome: PresentOutcome
         if let handler {
             outcome = handOffToHost(parked.campaign, handler: handler, generation: parked.generation)
-        } else {
+        } else if await waitForStableHost(parked.campaign, generation: parked.generation, displayEpoch: parked.epoch) {
             outcome = drawWithSDK(parked.campaign)
+        } else {
+            outcome = .notShown
         }
         await finishPresentation(outcome, campaign: parked.campaign, generation: parked.generation)
     }
@@ -892,7 +1138,13 @@ class InAppMessagingManager {
                 }
             }
         }
-        Task { await trackImpression(campaignId: campaignId, kind: kind, elementId: elementId) }
+        Task {
+            // A conversion (or click) reported for a message the SDK drew -
+            // e.g. `logConversion` from its web view - before the dwell means
+            // the person saw it: `displayed` first. A no-op otherwise.
+            if kind != .display { await countAsDisplayed(campaignId) }
+            await trackImpression(campaignId: campaignId, kind: kind, elementId: elementId)
+        }
     }
 
     // MARK: - Impression Tracking
@@ -1063,6 +1315,8 @@ class InAppMessagingManager {
             syncEpoch += 1
             displayEpoch += 1
             hostReportedDisplayed = false
+            dropUncountedLocked()
+            deferredForStability = nil
             displayedCampaigns.removeAll()
             campaignImpressions.removeAll()
             activeCampaigns.removeAll()
@@ -1083,6 +1337,11 @@ class InAppMessagingManager {
             logger.debug("Could not clear the campaign cache: \(error.localizedDescription)")
         }
         logger.debug("Cleared in-app messaging state")
+    }
+
+    /// Diagnostics for tests: whether an SDK-drawn message has counted as displayed (nil: not drawn).
+    func countedForTesting(_ campaignId: String) -> Bool? {
+        withState { sdkDrawn[campaignId]?.counted }
     }
 
     /// Diagnostics for tests: whether the single display slot is held.
@@ -1123,19 +1382,29 @@ extension InAppMessagingManager: InAppMessageViewDelegate {
 
     func messageViewDidDismiss(_ campaignId: String) {
         logger.debug("Message dismissed: \(campaignId)")
-        let (gap, currentGeneration) = withState { () -> (TimeInterval, Int) in
+        let (gap, currentGeneration, dropped) = withState { () -> (TimeInterval, Int, Bool) in
             // Only the message holding the slot frees it: a view left over
             // from before a reset() must not free the next user's message.
             releaseSlotLocked(campaignId: campaignId, generation: generation)
-            return (minDelayBetweenMessages, generation)
+            return (minDelayBetweenMessages, generation, removedUnseen.remove(campaignId) != nil)
         }
-        if let campaign = campaign(withId: campaignId) {
+        if !dropped, let campaign = campaign(withId: campaignId) {
             fireCallback { $0.onMessageDismiss?(campaign) }
         }
 
         Task { [weak self] in
             guard let self else { return }
-            await self.trackImpression(campaignId: campaignId, kind: .dismiss)
+            if dropped {
+                // Dropped before it counted (reset, identity or consent
+                // change): it never counted as seen, so nothing is reported.
+                self.logger.debug("Dismissal of \(campaignId) not reported: it never counted as displayed")
+            } else {
+                // A dismiss before the dwell means the person saw it:
+                // `displayed` first, then `dismissed`.
+                await self.countAsDisplayed(campaignId)
+                self.withState { self.sdkDrawn[campaignId] = nil }
+                await self.trackImpression(campaignId: campaignId, kind: .dismiss)
+            }
             // Evaluate the next campaign after the configured gap - unless a
             // reset happened meanwhile.
             try? await Task.sleep(nanoseconds: Self.nanoseconds(seconds: gap))
@@ -1151,6 +1420,9 @@ extension InAppMessagingManager: InAppMessageViewDelegate {
         }
 
         Task {
+            // A click before the dwell means the person saw it: `displayed`
+            // first, then `clicked`.
+            await countAsDisplayed(campaignId)
             await trackImpression(campaignId: campaignId, kind: .click, elementId: action)
 
             // http(s) only - the view already filtered, this is defence in

@@ -2453,8 +2453,12 @@ public class Joryio {
     /// nothing itself, so a host app can render messages with its own UI.
     ///
     /// A host that renders its own UI MUST report what happened via
-    /// `trackInAppImpression` - `"displayed"` when it is on screen and
-    /// `"dismissed"` when it goes away. Those reports are what count the
+    /// `trackInAppImpression` - `"displayed"` once it has been visible for
+    /// `InAppDisplay.IN_APP_DISPLAY_DWELL_MS` (the rule the SDK's own renderer
+    /// follows; a click or dismiss sooner counts too - report `"displayed"`
+    /// first), and `"dismissed"` when it goes away. A message that disappears
+    /// before the dwell (a screen change, the app backgrounded) should report
+    /// nothing, so it does not use up the campaign's frequency cap. Those reports are what count the
     /// message - `"displayed"` is also what spends the campaign's frequency
     /// budget, so a message handed over and never drawn costs nothing - and
     /// what free the SDK to hand over the next one (after 30 seconds without a
@@ -2528,6 +2532,9 @@ public class Joryio {
         guard canSend else {
             return InAppFormSubmitResponse(ok: false, message: "Something went wrong. Please try again.")
         }
+        // Submitting a form means the person saw the message: count it as
+        // displayed first if the dwell had not elapsed yet.
+        await inAppMessaging.noteInteraction(campaignId: campaignId)
         var encoded: [String: InAppFormValue] = [:]
         for (key, raw) in values {
             if let list = raw as? [Any] {
@@ -2555,7 +2562,8 @@ public class Joryio {
     /// Report an in-app impression for a message YOU rendered.
     ///
     /// - Parameters:
-    ///   - action: `displayed`, `clicked`, `dismissed` or `converted` (the
+    ///   - action: `displayed` (once it has been visible for
+    ///     `InAppDisplay.IN_APP_DISPLAY_DWELL_MS`), `clicked`, `dismissed` or `converted` (the
     ///     backend's vocabulary; its listed synonyms are accepted too, anything
     ///     else is refused with a log line). Matches Android.
     ///   - elementId: for a click, WHICH button or link (its id). Optional.
