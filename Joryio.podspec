@@ -1,7 +1,7 @@
 Pod::Spec.new do |s|
   s.name             = 'Joryio'
   # Keep in sync with the other SDKs - sdk-version-parity.spec.ts pins it.
-  s.version          = '1.3.2'
+  s.version          = '1.3.3'
   s.summary          = 'Joryio iOS SDK - identify, track, push, and in-app messaging.'
   s.description      = <<-DESC
     Official Joryio SDK for iOS: user identification, event tracking with
@@ -11,9 +11,11 @@ Pod::Spec.new do |s|
   s.homepage         = 'https://joryio.com'
   s.license          = { :type => 'Commercial', :file => 'LICENSE' }
   s.author           = { 'Joryio' => 'support@joryio.com' }
-  # CocoaPods requires a source; the git URL is the canonical distribution
-  # point once the SDK repo is published. The React Native podspec depends on
-  # this pod ("Joryio", "~> 1.0"), which is why it must exist.
+  # A git source on purpose: CocoaPods trunk stops taking new versions
+  # (read-only from 2026-12-02), and this spec at the public repo's tag is what
+  # `pod 'Joryio', :git => ..., :tag => ...` installs without trunk.
+  # mirror.sh checks the tag carries it (check-ios-podspec.sh). React Native
+  # and Unity take the SDK as a Swift package, not from this pod.
   s.source           = { :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => s.version.to_s }
 
   s.ios.deployment_target = '14.0'

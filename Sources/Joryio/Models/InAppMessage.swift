@@ -729,3 +729,24 @@ public enum InAppSizing {
         max(0, min(maxWidth, available - 2 * margin))
     }
 }
+
+/**
+ When an in-app message counts as DISPLAYED. The same rule, and the same
+ constant name and value, on every Joryio SDK.
+
+ A message the SDK draws is reported `displayed` - and spends the campaign's
+ frequency budget - only once it has stayed on screen for
+ `IN_APP_DISPLAY_DWELL_MS` while the app was active. A message that is gone
+ before then (the app went to the background, the window went away, a reset)
+ reports nothing and spends nothing, so it can show again later. A click or a
+ dismiss before the dwell means the person saw it: `displayed` is reported
+ first, then the click or dismiss.
+
+ An app that draws messages itself (`setInAppMessageCallback`) should apply the
+ same rule: report `displayed` only once its message has been visible for
+ `IN_APP_DISPLAY_DWELL_MS`.
+ */
+public enum InAppDisplay {
+    /// How long, in milliseconds, a message must be on screen to count as displayed.
+    public static let IN_APP_DISPLAY_DWELL_MS: Int = 1000
+}

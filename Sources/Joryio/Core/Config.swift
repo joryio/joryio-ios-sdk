@@ -1,7 +1,7 @@
 import Foundation
 
 /// SDK version
-public let SDK_VERSION = "1.3.2"
+public let SDK_VERSION = "1.3.3"
 
 /// Default configuration constants
 public struct ConfigDefaults {

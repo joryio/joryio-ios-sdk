@@ -34,13 +34,13 @@ Add `JoryioUI` if you want the SDK to draw in-app messages. Without it, messages
 
 ### Swift Package Manager (recommended)
 
-In Xcode: **File → Add Package Dependencies**, enter `https://github.com/joryio/joryio-ios-sdk.git`, choose version `1.3.1` or later, and add `Joryio` and, if you want in-app display, `JoryioUI` to your app target.
+In Xcode: **File → Add Package Dependencies**, enter `https://github.com/joryio/joryio-ios-sdk.git`, choose version `1.3.2` or later, and add `Joryio` and, if you want in-app display, `JoryioUI` to your app target.
 
 Or in `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/joryio/joryio-ios-sdk.git", from: "1.3.1")
+    .package(url: "https://github.com/joryio/joryio-ios-sdk.git", from: "1.3.2")
 ],
 targets: [
     .target(
@@ -53,21 +53,21 @@ targets: [
 ]
 ```
 
-### CocoaPods (legacy)
+### CocoaPods (deprecated)
 
-CocoaPods trunk becomes read-only on 2 December 2026, so the last Joryio pod is the last version released before that date (1.3.1 is published there too); later releases ship through Swift Package Manager only, which is the recommended route. To move, delete the `pod 'Joryio...'` lines, run `pod install`, and add the package as above. A Notification Service Extension then writes `import JoryioNotificationServiceExtension` instead of `import Joryio`.
+CocoaPods is deprecated in favour of Swift Package Manager. CocoaPods trunk, the registry a plain `pod 'Joryio'` downloads from, is closing (read-only from 2 December 2026), so new releases are not guaranteed to be on it. If your app has to stay on CocoaPods, install from this repository's git tag - it does not use trunk, and every release from 1.3.0 on supports it, betas included. Pin the version with `:tag` and change the tag to upgrade (`pod update` does not move it). To move to Swift Package Manager, delete the `pod 'Joryio...'` lines, run `pod install`, and add the package as above; a Notification Service Extension then writes `import JoryioNotificationServiceExtension` instead of `import Joryio`.
 
 ```ruby
 platform :ios, '14.0'
 
 target 'MyApp' do
-  pod 'Joryio/UI', '~> 1.3'   # tracking, identity, push AND in-app display
-  # pod 'Joryio', '~> 1.3'    # tracking, identity and push only - no WebKit linked
+  pod 'Joryio/UI', :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => '1.3.2'   # tracking, identity, push AND in-app display
+  # pod 'Joryio', :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => '1.3.2'    # tracking, identity and push only - no WebKit linked
 end
 
 # Only if you add a Notification Service Extension for rich images:
 target 'NotificationService' do
-  pod 'Joryio/NotificationServiceExtension', '~> 1.3'
+  pod 'Joryio/NotificationServiceExtension', :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => '1.3.2'
 end
 ```
 
@@ -214,7 +214,7 @@ All parameters of `JoryioConfig` are optional:
 |-----------|---------|-------------|
 | `enabled` | `true` | `false` turns in-app messaging off: no sync, nothing displayed |
 | `allowHtmlJsInAppMessages` | `false` | Display HTML messages (see [In-app messaging](#in-app-messaging)) |
-| `holdInAppMessagesForHandler` | `false` | Your app draws in-app messages and calls `setInAppMessageCallback` after `initialize()`: hold messages until it does (or until `clearInAppMessageCallback()`), so none is drawn by the SDK first |
+| `holdInAppMessagesForHandler` | `false` | Since 1.3.2. Your app draws in-app messages and calls `setInAppMessageCallback` after `initialize()`: hold messages until it does (or until `clearInAppMessageCallback()`), so none is drawn by the SDK first |
 | `syncInterval` | `300` | Minimum seconds between automatic syncs (launch, foreground) |
 | `onMessageDisplay` | `nil` | Called on the main thread after the SDK displays a message |
 | `onMessageClick` | `nil` | Called on the main thread with the message and the tapped element's name |
