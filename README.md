@@ -53,21 +53,21 @@ targets: [
 ]
 ```
 
-### CocoaPods (legacy)
+### CocoaPods (deprecated)
 
-CocoaPods trunk becomes read-only on 2 December 2026, so the last Joryio pod is the last version released before that date (1.3.2 is published there too); later releases ship through Swift Package Manager only, which is the recommended route. To move, delete the `pod 'Joryio...'` lines, run `pod install`, and add the package as above. A Notification Service Extension then writes `import JoryioNotificationServiceExtension` instead of `import Joryio`.
+CocoaPods is deprecated in favour of Swift Package Manager. CocoaPods trunk, the registry a plain `pod 'Joryio'` downloads from, is closing (read-only from 2 December 2026), so new releases are not guaranteed to be on it. If your app has to stay on CocoaPods, install from this repository's git tag - it does not use trunk, and every release from 1.3.0 on supports it, betas included. Pin the version with `:tag` and change the tag to upgrade (`pod update` does not move it). To move to Swift Package Manager, delete the `pod 'Joryio...'` lines, run `pod install`, and add the package as above; a Notification Service Extension then writes `import JoryioNotificationServiceExtension` instead of `import Joryio`.
 
 ```ruby
 platform :ios, '14.0'
 
 target 'MyApp' do
-  pod 'Joryio/UI', '~> 1.3'   # tracking, identity, push AND in-app display
-  # pod 'Joryio', '~> 1.3'    # tracking, identity and push only - no WebKit linked
+  pod 'Joryio/UI', :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => '1.3.2'   # tracking, identity, push AND in-app display
+  # pod 'Joryio', :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => '1.3.2'    # tracking, identity and push only - no WebKit linked
 end
 
 # Only if you add a Notification Service Extension for rich images:
 target 'NotificationService' do
-  pod 'Joryio/NotificationServiceExtension', '~> 1.3'
+  pod 'Joryio/NotificationServiceExtension', :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => '1.3.2'
 end
 ```
 
