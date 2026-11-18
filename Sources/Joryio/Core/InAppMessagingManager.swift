@@ -16,6 +16,10 @@ class InAppMessagingManager {
     // can't hit an exclusive-access crash.
     private let stateLock = NSLock()
     private var activeCampaigns: [InAppCampaign] = []
+    /// Form tokens of messages presented or handed to the host, by campaign
+    /// id: a re-check campaign gets its token from the display-time resolve,
+    /// which is not in `activeCampaigns` (BACKLOG D371 item 4).
+    private var presentedFormTokens: [String: String] = [:]
     private var displayedCampaigns: Set<String> = []
     private var campaignImpressions: [String: [Date]] = [:]
     private var lastSyncTime: Date?
@@ -645,6 +649,7 @@ class InAppMessagingManager {
             guard let resolved = await resolveForDisplay(campaign) else { return .notShown }
             campaign = resolved
         }
+        rememberFormToken(of: campaign)
 
         // HTML runs in this SDK's web view only when the integration opted in.
         // THE FLAG IS ABOUT THIS SDK'S WEB VIEW, so it applies only when THIS
@@ -1253,6 +1258,20 @@ class InAppMessagingManager {
         withState { activeCampaigns.first { $0.id == id } }
     }
 
+    /// Keep the form token of a campaign being presented (a re-check
+    /// campaign's comes from the display-time resolve).
+    func rememberFormToken(of campaign: InAppCampaign) {
+        guard let token = campaign.formToken else { return }
+        let id = campaign.id
+        withState { presentedFormTokens[id] = token }
+    }
+
+    /// The form token the server served with this campaign, for the form
+    /// submit: the presented copy first, else the synced one.
+    func formToken(forCampaignId id: String) -> String? {
+        withState { presentedFormTokens[id] ?? activeCampaigns.first { $0.id == id }?.formToken }
+    }
+
     // MARK: - Persistence
 
     private func loadCachedData() {
@@ -1320,6 +1339,10 @@ class InAppMessagingManager {
             displayedCampaigns.removeAll()
             campaignImpressions.removeAll()
             activeCampaigns.removeAll()
+            // reset() / wipeData(): the served form tokens belong to the
+            // visitor that is going away. NOT on identify (invalidate): the
+            // anonymousId stays, and every SDK keeps the token there.
+            presentedFormTokens.removeAll()
             isDisplaying = false
             slotCampaignId = nil
             hostHeldCampaignId = nil

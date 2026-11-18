@@ -34,13 +34,13 @@ Add `JoryioUI` if you want the SDK to draw in-app messages. Without it, messages
 
 ### Swift Package Manager (recommended)
 
-In Xcode: **File → Add Package Dependencies**, enter `https://github.com/joryio/joryio-ios-sdk.git`, choose version `1.3.2` or later, and add `Joryio` and, if you want in-app display, `JoryioUI` to your app target.
+In Xcode: **File → Add Package Dependencies**, enter `https://github.com/joryio/joryio-ios-sdk.git`, choose version `1.3.3` or later, and add `Joryio` and, if you want in-app display, `JoryioUI` to your app target.
 
 Or in `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/joryio/joryio-ios-sdk.git", from: "1.3.2")
+    .package(url: "https://github.com/joryio/joryio-ios-sdk.git", from: "1.3.3")
 ],
 targets: [
     .target(
@@ -61,13 +61,13 @@ CocoaPods is deprecated in favour of Swift Package Manager. CocoaPods trunk, the
 platform :ios, '14.0'
 
 target 'MyApp' do
-  pod 'Joryio/UI', :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => '1.3.2'   # tracking, identity, push AND in-app display
-  # pod 'Joryio', :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => '1.3.2'    # tracking, identity and push only - no WebKit linked
+  pod 'Joryio/UI', :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => '1.3.3'   # tracking, identity, push AND in-app display
+  # pod 'Joryio', :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => '1.3.3'    # tracking, identity and push only - no WebKit linked
 end
 
 # Only if you add a Notification Service Extension for rich images:
 target 'NotificationService' do
-  pod 'Joryio/NotificationServiceExtension', :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => '1.3.2'
+  pod 'Joryio/NotificationServiceExtension', :git => 'https://github.com/joryio/joryio-ios-sdk.git', :tag => '1.3.3'
 end
 ```
 
@@ -423,6 +423,24 @@ Channels: `email`, `sms`, `whatsapp`, `push`, `viber`. Statuses: `optedIn`, `sub
 A change made while tracking consent is pending waits on the device and is sent when consent is granted; one that fails is kept, across restarts and `reset()`, and sent again.
 
 An **unsubscribe** - `status: "unsubscribed"`, or `removeFromSubscriptionGroup` - is a withdrawal: it is accepted and delivered even when the person has opted out, consent is pending or denied, or after `wipeData()`. Subscribing and joining a group are not.
+
+## Recognise people who click your messages
+
+A tracked link in a Joryio message carries a `jr_t` token. When that link opens your app (a universal link or a custom URL scheme), pass the URL to the SDK and the visits and events from this device are attributed to the contact the message was sent to (attribution only - nothing is written to that contact's profile, and the device is not signed in as them):
+
+```swift
+// UIKit, universal links
+func application(_ application: UIApplication, continue userActivity: NSUserActivity,
+                 restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void) -> Bool {
+    if let url = userActivity.webpageURL { Joryio.shared.identifyFromLink(url) }
+    return true
+}
+
+// SwiftUI
+.onOpenURL { url in Joryio.shared.identifyFromLink(url) }
+```
+
+With scenes, call it from `scene(_:continue:)` and `scene(_:openURLContexts:)` too. A URL without `jr_t` does nothing, so you can pass every URL your app opens. The SDK acts only when tracking is allowed and nobody is identified on the device: a signed-in user is never re-attached by a link, an opt-out or a denied consent drops the token, and while consent is pending the token is kept in memory and sent once consent is granted. It is never stored on the device.
 
 ## Privacy controls
 

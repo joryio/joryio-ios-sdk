@@ -135,6 +135,14 @@ public struct InAppCampaign: Codable {
      */
     public let deliveryToken: String?
 
+    /**
+     Joryio-signed proof that THIS form was served to THIS visitor (BACKLOG
+     D371 item 4), present only when the message carries a form. Sent back
+     as-is on the form submit; the server reads campaign, variant and form
+     from it. Opaque; lives 24 hours, and every sync brings a fresh one.
+     */
+    public let formToken: String?
+
     /// The content to render, resolved from the wire fields.
     ///
     /// `nil` means the campaign carries no usable document. Callers must treat
@@ -341,6 +349,7 @@ public struct InAppCampaign: Codable {
         // missing from it never decodes - the token would silently always be nil
         // and every impression would look unverifiable to the server.
         case deliveryToken
+        case formToken
     }
 
     public init(from decoder: Decoder) throws {
@@ -369,6 +378,7 @@ public struct InAppCampaign: Codable {
         // Tolerant like every field here: a server that predates the delivery
         // token simply yields nil, which the track path treats as "omit".
         deliveryToken = try? c.decode(String.self, forKey: .deliveryToken)
+        formToken = try? c.decode(String.self, forKey: .formToken)
     }
 }
 
@@ -684,7 +694,20 @@ struct InAppFormSubmitRequest: Encodable {
     let campaignId: String
     let userId: String?
     let anonymousId: String
+    /// The form token served with the message; omitted when nil (an older server).
+    var formToken: String? = nil
     let values: [String: InAppFormValue]
+
+    private enum CodingKeys: String, CodingKey { case campaignId, userId, anonymousId, formToken, values }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(campaignId, forKey: .campaignId)
+        try c.encodeIfPresent(userId, forKey: .userId)
+        try c.encode(anonymousId, forKey: .anonymousId)
+        try c.encodeIfPresent(formToken, forKey: .formToken)
+        try c.encode(values, forKey: .values)
+    }
 }
 
 /// The server's verdict, handed back to the message runtime as it is.
@@ -693,12 +716,17 @@ public struct InAppFormSubmitResponse: Codable {
     public let message: String?
     public let redirect: String?
     public let errors: [String]?
+    /// Why the server refused the form before reading its values, when it did:
+    /// form_token_invalid, form_token_expired, form_token_required,
+    /// form_changed or form_token_used (BACKLOG D371 item 4).
+    public let reason: String?
 
-    public init(ok: Bool, message: String? = nil, redirect: String? = nil, errors: [String]? = nil) {
+    public init(ok: Bool, message: String? = nil, redirect: String? = nil, errors: [String]? = nil, reason: String? = nil) {
         self.ok = ok
         self.message = message
         self.redirect = redirect
         self.errors = errors
+        self.reason = reason
     }
 }
 

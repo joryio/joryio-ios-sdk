@@ -83,6 +83,12 @@ public class Joryio {
     /// id: it is announced by the next event, or the next foreground,
     /// exactly as a timed-out session is (SDK contract v6, 66).
     private var _sessionStartDue = false
+    /// Click-link tokens (`jr_t`) this process has accepted - sent or held -
+    /// so the same link handed in twice is sent once. Memory only.
+    private var _acceptedLinkTokens = Set<String>()
+    /// Click-link tokens held while consent is pending: memory only, never
+    /// on disk; sent on `.granted`, dropped on a denial, an opt-out, reset().
+    private var _heldLinkTokens: [String] = []
     /// initialize() refused the key or the host. Calls that answer through
     /// a callback then answer at once instead of waiting for a start that
     /// will not come (contract v4, 48).
@@ -215,7 +221,10 @@ public class Joryio {
     /// wipeData() or consent denied made before init removes it. unregisterPush,
     /// flush, reset and push-token registration are not collection and stay
     /// (scan 3, M3) - an opt-out used to discard an unregisterPush() too.
-    private var preInitCalls: [(call: (Joryio) -> Void, purgeable: Bool, settle: (() -> Void)?)] = []
+    /// `dropped`: answers a caller-visible callback when the call is
+    /// discarded before it runs (resetTo: `false`), so an awaiting host never
+    /// hangs. Called outside the lock.
+    private var preInitCalls: [(call: (Joryio) -> Void, purgeable: Bool, settle: (() -> Void)?, dropped: (() -> Void)?)] = []
     /// True once the buffer has been replayed. Until then a call is buffered
     /// even while initialize() is running, so it cannot overtake older ones.
     private var preInitDrained = false
@@ -254,6 +263,7 @@ public class Joryio {
         purgeable: Bool = true,
         keptWhileRefused: Bool = false,
         settle: (() -> Void)? = nil,
+        dropped onDropped: (() -> Void)? = nil,
         method: String = #function
     ) -> Bool {
         bufferLock.lock()
@@ -276,21 +286,24 @@ public class Joryio {
             } else {
                 print("[Joryio] \(method) called before initialize() while tracking is opted out or consent is denied: dropped.")
             }
+            onDropped?()
             return false
         }
         var dropped = false
+        var evicted: (() -> Void)?
         if preInitCalls.count >= Self.maxPreInitCalls {
             // The oldest call that COLLECTS goes first; a withdrawal, an
             // unregisterPush(), reset() or flush() only when nothing else is
             // left (SDK contract v5, 51). A burst of track() calls used to
             // push out an unsubscribe made before them.
             let index = preInitCalls.firstIndex(where: { $0.purgeable }) ?? 0
-            preInitCalls.remove(at: index)
+            evicted = preInitCalls.remove(at: index).dropped
             if index < preWipeCallCount { preWipeCallCount -= 1 }
             dropped = true
         }
-        preInitCalls.append((call, purgeable, settle))
+        preInitCalls.append((call, purgeable, settle, onDropped))
         bufferLock.unlock()
+        evicted?()
         if dropped {
             print("[Joryio] More than \(Self.maxPreInitCalls) calls were made before initialize(); dropped the oldest data call.")
         }
@@ -345,9 +358,11 @@ public class Joryio {
     /// Drop the buffered calls that collect (see `preInitCalls`).
     private func purgeCollectingPreInitCalls(markingWipe: Bool = false) {
         bufferLock.lock()
+        let dropped = preInitCalls.filter(\.purgeable).compactMap(\.dropped)
         preInitCalls.removeAll { $0.purgeable }
         if markingWipe { preWipeCallCount = preInitCalls.count }
         bufferLock.unlock()
+        dropped.forEach { $0() }
     }
 
     /// Run the calls made before a pre-init wipeData(), under the identity
@@ -1468,7 +1483,48 @@ public class Joryio {
     /// waiting to reach the server. Safe before `initialize()`.
     public func reset() {
         guard runNowOrQueue({ $0.reset() }, purgeable: false) else { return }
+        resetIdentity(adopting: nil)
+    }
 
+    /// `reset()`, then adopt `anonymousId` instead of a new random id (BACKLOG
+    /// D366). For a host that keeps its own visitor id, so the SDK and the
+    /// host stay ONE visitor after a logout.
+    ///
+    /// Everything `reset()` does happens. The id must be 8 to 255 letters,
+    /// digits, `.`, `_`, `:` or `-`, must not have the shape of a Joryio
+    /// profile id (24 lowercase hex), must not be the user id this SDK holds
+    /// (signed in, or kept for withdrawals), and must not be the anonymous id
+    /// it holds while a user is signed in (that id is tied to the signed-in
+    /// user's profile). A refused id is logged and the call is a plain
+    /// `reset()` - a random id - so a logout is never skipped. The same rule
+    /// on all five SDKs. Safe before `initialize()`.
+    ///
+    /// `onResult` gets `true` when the id was adopted, `false` when it was
+    /// refused (a random id was used). It runs once, when the call runs: for
+    /// a call made before `initialize()`, after it; a held call discarded
+    /// before then never answers.
+    ///
+    /// An anonymous id is a claim, not a credential: whoever holds one already
+    /// tied to an identified profile is treated as that visitor, unless SDK
+    /// Authentication is on (anonymous writes to an identified profile are
+    /// then refused). Adopt only ids your own app issued for this device.
+    public func resetTo(_ anonymousId: String, onResult: ((Bool) -> Void)? = nil) {
+        // Exactly once: the run answers true / false, a discarded held call false.
+        let answer = onResult.map(ResetTo.once)
+        guard runNowOrQueue({ $0.resetTo(anonymousId, onResult: answer) }, purgeable: false, dropped: answer.map { a in { a(false) } }) else { return }
+        let userId = identity.getUserId()
+        let refusal = ResetTo.refusal(
+            anonymousId,
+            knownUserIds: [userId, identity.withdrawalUserId()],
+            signedInAnonymousId: userId != nil ? identity.getAnonymousId() : nil,
+            rememberedSignedInAnonymousIds: storage.getSignedInAnonymousIds()
+        )
+        if let refusal { logger.error("\(refusal); a random anonymous id is used instead") }
+        resetIdentity(adopting: refusal == nil ? anonymousId : nil)
+        answer?(refusal == nil)
+    }
+
+    private func resetIdentity(adopting anonymousId: String?) {
         logger.info("Resetting SDK state")
 
         cancelAttributeFlush()
@@ -1484,8 +1540,13 @@ public class Joryio {
         // standby token for someone signing in next (contract v8, 82).
         authStore.retireToken(forUser: identity.withdrawalUserId())
 
-        identity.reset()
+        // The outgoing user's anonymous id is tied to their profile: a later
+        // resetTo() must never hand it to someone else (D366).
+        if identity.getUserId() != nil { storage.rememberSignedInAnonymousId(identity.getAnonymousId()) }
+        identity.reset(adopting: anonymousId)
         session.resetSession()
+        // A click-link token held for the outgoing visitor is not the next one's.
+        locked { _heldLinkTokens.removeAll() }
 
         // The next user never sees the previous user's campaigns, and nothing
         // scheduled for the previous user fires.
@@ -1854,6 +1915,7 @@ public class Joryio {
         storage?.clearReportedPushPermission()
         queue?.clearQueue()
         outbox?.removeAll { $0.isCollection }
+        locked { _heldLinkTokens.removeAll() }
         if owesSessionStart { markSessionStartOwed() }
     }
 
@@ -1921,6 +1983,9 @@ public class Joryio {
         storage.clearSession()
         storage.setUserId(nil)
         storage.clearDeviceId()
+        // Local data like any other (D366): resetTo's memory of signed-in
+        // users' anonymous ids goes with the wipe, the same on all five SDKs.
+        storage.clearSignedInAnonymousIds()
         inAppMessaging.clear()
         // The anonymous id too, in storage AND in memory - it is the key the
         // erased profile was filed under. Clear storage first, then let the
@@ -2114,7 +2179,7 @@ public class Joryio {
         // this identify is older than all of them, so it goes first.
         bufferLock.lock()
         if !preInitDrained, replayThread != Thread.current {
-            preInitCalls.insert(({ $0.identify(held) }, true, nil), at: 0)
+            preInitCalls.insert(({ $0.identify(held) }, true, nil, nil), at: 0)
             bufferLock.unlock()
             return
         }
@@ -2154,6 +2219,7 @@ public class Joryio {
         queue.resetBackoff()
         queue.flushSync(force: true)
         retryOwedRequests(force: true)
+        releaseHeldLinkTokens()
         pushNotifications.retryRegistrationIfUnconfirmed()
         Task { [weak self] in
             guard let self else { return }
@@ -2549,6 +2615,9 @@ public class Joryio {
             campaignId: campaignId,
             userId: identity.getUserId(),
             anonymousId: identity.getAnonymousId(),
+            // Looked up by campaign id, so a host-rendered message (React
+            // Native, Unity, a custom renderer) sends it too (D371 item 4).
+            formToken: inAppMessaging.formToken(forCampaignId: campaignId),
             values: encoded
         )
         do {
@@ -2742,6 +2811,83 @@ public class Joryio {
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 64, trimmed.count <= 200, trimmed.count % 2 == 0 else { return false }
         return trimmed.unicodeScalars.allSatisfy { CharacterSet(charactersIn: "0123456789abcdefABCDEF").contains($0) }
+    }
+
+    // MARK: - Click-link identity
+
+    /**
+     Recognise the person who clicked a tracked link in a Joryio message.
+
+     Pass the URL that opened the app - from `application(_:continue:restorationHandler:)`,
+     `scene(_:continue:)`, `application(_:open:options:)` or SwiftUI's
+     `onOpenURL`. When it carries the `jr_t` token the click redirect added,
+     this visitor is attached to the contact the message was sent to.
+     Fire-and-forget; a URL without a well-formed `jr_t` does nothing.
+
+     - Already identified (`identify()` / a `userId`): nothing - a link never
+       overrides a stronger identity (the server enforces this too).
+     - Opted out or consent `.denied`: the token is dropped.
+     - Consent `.pending`: held in memory only and sent on `.granted`.
+     - Before `initialize()`: held in memory with the other calls made
+       before it, and handled at init.
+     - The same token twice in one process: sent once.
+
+     The token is never persisted, and never logged above debug.
+     */
+    public func identifyFromLink(_ url: URL) {
+        guard ClickIdentity.token(from: url) != nil else { return }
+        guard runNowOrQueue({ $0.identifyFromLink(url) }) else { return }
+        guard let token = ClickIdentity.token(from: url) else { return }
+        guard canCollect else {
+            logger.debug("Opted out or consent denied: click-link token dropped")
+            return
+        }
+        guard identity.getUserId() == nil else {
+            logger.debug("Already identified: click-link token ignored")
+            return
+        }
+        // nil: seen before. true: send now. false: held (consent pending).
+        let decision: Bool? = locked {
+            guard _acceptedLinkTokens.insert(token).inserted else { return nil }
+            if _isInitialized && !_isOptedOut && _consent == .granted { return true }
+            if _heldLinkTokens.count >= ClickIdentity.maxHeldTokens { _heldLinkTokens.removeFirst() }
+            _heldLinkTokens.append(token)
+            return false
+        }
+        switch decision {
+        case .some(true):
+            sendLinkToken(token)
+        case .some(false):
+            logger.debug("Consent pending: click-link token held in memory until a decision")
+        case .none:
+            logger.debug("Click-link token already handled in this process")
+        }
+    }
+
+    private func releaseHeldLinkTokens() {
+        let tokens: [String] = locked {
+            let held = _heldLinkTokens
+            _heldLinkTokens.removeAll()
+            return held
+        }
+        guard !tokens.isEmpty, canSend else { return }
+        // Identified while consent was pending: the stronger identity wins.
+        guard identity.getUserId() == nil else { return }
+        tokens.forEach { sendLinkToken($0) }
+    }
+
+    private func sendLinkToken(_ token: String) {
+        let request = IdentifyLinkRequest(token: token, anonymousId: identity.getAnonymousId())
+        let network = self.network
+        let logger = self.logger
+        Task {
+            // Best-effort: "ok" and "ignored" alike change nothing here.
+            do {
+                try await network?.identifyLink(request)
+            } catch {
+                logger?.debug("Click-link identity not sent: \(error.localizedDescription)")
+            }
+        }
     }
 
     /// Track a push-notification click by tracking id.

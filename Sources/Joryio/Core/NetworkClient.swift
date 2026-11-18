@@ -328,6 +328,15 @@ class NetworkClient {
         logger.debug("User identified: \(maskIdentifier(request.userId))")
     }
 
+    /// Click-link identity (`/v1/identify-link`): the same endpoint, headers
+    /// and SDK-key auth as identify. A 4xx is final; a 5xx or a transport
+    /// error gets the normal retry. The token is never logged.
+    func identifyLink(_ request: IdentifyLinkRequest) async throws {
+        let endpoint = "\(apiEndpoint)\(ClickIdentity.identifyLinkPath)"
+        try await sendRequest(endpoint: endpoint, method: "POST", body: request)
+        logger.debug("Click-link identity sent")
+    }
+
     /// A labelled alias (`/v1/alias/add`). Works for an anonymous visitor too:
     /// the request carries the anonymous id always and the user id only when
     /// there is one.

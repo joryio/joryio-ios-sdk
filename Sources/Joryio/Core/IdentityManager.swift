@@ -197,13 +197,17 @@ class IdentityManager {
     /// filed under the previous user's anonymous profile and merged into that
     /// person on the server. A shared device is exactly where reset() is
     /// called. SDK contract 6; matches web and Android.
-    func reset() {
+    ///
+    /// `anonymousId`: the id to adopt instead of a new random one (`resetTo`,
+    /// already validated by the caller).
+    func reset(adopting anonymousId: String? = nil) {
         logger.info("Resetting user identity")
 
         storage.setUserId(nil)
         writeHeldUserId(nil)
         storage.clearUserAttributes()
         storage.clearAnonymousId()
+        if let anonymousId { storage.setAnonymousId(anonymousId) }
         let newAnonymousId = storage.getAnonymousId()
 
         withLock {
