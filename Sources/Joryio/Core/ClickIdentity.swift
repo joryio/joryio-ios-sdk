@@ -6,8 +6,10 @@ import Foundation
  When someone clicks a tracked link in a Joryio message, the click redirect
  appends an opaque, signed token as `jr_t`. An app opened by that link (a
  universal link / deep link) hands the URL to `Joryio.shared.identifyFromLink(_:)`,
- which sends the token with this SDK's anonymous id to `/v1/identify-link`,
- and the server attaches this visitor to the contact the message was sent to.
+ which sends the token with this SDK's anonymous id to `/v1/identify-link`.
+ The server uses it only to attribute this visitor's events to the contact
+ the message was sent to - attribution only: it never identifies the person
+ or merges this visitor into the contact (only identify() does that).
 
  The wire values are byte-identical on all five SDKs (pinned by the backend
  spec sdk-click-identity-parity.spec.ts): the query parameter `jr_t`, the

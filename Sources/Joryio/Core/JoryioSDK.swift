@@ -2821,7 +2821,9 @@ public class Joryio {
      Pass the URL that opened the app - from `application(_:continue:restorationHandler:)`,
      `scene(_:continue:)`, `application(_:open:options:)` or SwiftUI's
      `onOpenURL`. When it carries the `jr_t` token the click redirect added,
-     this visitor is attached to the contact the message was sent to.
+     this app's events are attributed to the contact the message was sent
+     to. Attribution only: the person is not identified and this profile is
+     never merged into the contact (only `identify()` does that).
      Fire-and-forget; a URL without a well-formed `jr_t` does nothing.
 
      - Already identified (`identify()` / a `userId`): nothing - a link never
