@@ -589,7 +589,7 @@ class PushNotificationManager: NSObject {
         if PushPayloadKeys.isJoryio(userInfo),
            let deepLink = userInfo[PushPayloadKeys.deepLink] as? String,
            !deepLink.isEmpty {
-            handleDeepLink(deepLink)
+            handleDeepLink(deepLink, campaignId: userInfo[PushPayloadKeys.campaignId] as? String)
         }
 
         completionHandler()
@@ -623,6 +623,24 @@ class PushNotificationManager: NSObject {
                 // push woke the app and it went straight back to sleep.
                 logger.debug("Silent push: syncing in-app campaigns")
                 await Joryio.shared.syncInAppCampaigns()
+                // A journey Placement step on an older backend nudges with
+                // `in_app`: placements on screen refresh too.
+                Joryio.shared.refreshPlacements()
+            case "placements":
+                // A journey Placement step or a test send (D444): ask again
+                // for the placements on screen.
+                logger.debug("Silent push: refreshing placements")
+                Joryio.shared.refreshPlacements()
+            case "cards":
+                // An "Add card" journey step or a card test send (D444
+                // Phase 3): fetch the feed again.
+                logger.debug("Silent push: refreshing cards")
+                Joryio.shared.refreshCards()
+
+            case JoryioFlags.FLAG_SYNC_PUSH_VALUE:
+                // "flags": a flag changed on the server; refresh now (BACKLOG D446).
+                logger.debug("Silent push: refreshing flags")
+                await Joryio.shared.refreshFlags()
             default:
                 // Named rather than silently ignored: an unknown type means the
                 // backend and the SDK disagree. A "user_attributes" branch used
@@ -633,9 +651,13 @@ class PushNotificationManager: NSObject {
         }
     }
 
-    /// Handle deep link
-    private func handleDeepLink(_ deepLink: String) {
-        guard let url = URL(string: deepLink) else {
+    /// Open a push's tap target: the app's link handler first
+    /// (`setLinkHandler`, source `push`), then - as before - the system,
+    /// except that an https link on one of the app's associated domains goes
+    /// to its own universal-link handling with `forwardUniversalLinks`. A
+    /// refused scheme (`javascript:`, `data:`, `file:`, ...) is never opened.
+    private func handleDeepLink(_ deepLink: String, campaignId: String?) {
+        guard let url = URL(string: deepLink.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             logger.error("Invalid deep link URL: \(deepLink)")
             return
         }
@@ -643,11 +665,16 @@ class PushNotificationManager: NSObject {
         logger.info("Opening deep link: \(deepLink)")
 
         Task { @MainActor in
-            if UIApplication.shared.canOpenURL(url) {
-                UIApplication.shared.open(url)
-            } else {
-                logger.error("Cannot open deep link: \(deepLink)")
+            let routed = LinkRouter.route(url, source: .push, campaignId: campaignId, allowOtherSchemes: true) { [logger] in
+                if LinkRouter.isSafeHttpUrl(url) {
+                    LinkRouter.openExternally(url)
+                } else if UIApplication.shared.canOpenURL(url) {
+                    UIApplication.shared.open(url)
+                } else {
+                    logger.error("Cannot open deep link: \(deepLink)")
+                }
             }
+            if !routed { logger.error("Push link refused: \(url.scheme ?? "no scheme")") }
         }
     }
 

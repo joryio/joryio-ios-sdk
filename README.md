@@ -318,7 +318,7 @@ Every Joryio push carries the same keys on iOS, Android and web, at the root of 
 | `jry_campaign_id` | The campaign id, or the journey id for a journey send. For your app; the SDK does not act on it |
 | `jry_deep_link` | Opened with `UIApplication.open` when the notification is tapped |
 | `jry_image_url` | Image attached by `JoryioNotificationService` (`attachment-url` is accepted too) |
-| `jry_sync` | Silent sync nudge. `in_app` (or `campaigns`) makes the SDK fetch in-app campaigns now; nothing is shown |
+| `jry_sync` | Silent sync nudge. `in_app` (or `campaigns`) makes the SDK fetch in-app campaigns now; `flags` refreshes feature flags; nothing is shown |
 
 ## In-app messaging
 

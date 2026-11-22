@@ -5,6 +5,7 @@ import WebKit
 // compiled INTO the Joryio module, where this import is a warning that
 // fails `pod lib lint` (and so `pod trunk push`).
 import Joryio
+@_spi(JoryioInternal) import Joryio
 #endif
 
 /**
@@ -451,7 +452,10 @@ final class InAppWebMessageView: BaseMessageView {
         case "openUrl":
             // A link the bootstrap already reported as a click: open it, count nothing.
             guard let raw = args["url"] as? String, let url = URL(string: raw), let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return }
-            DispatchQueue.main.async { UIApplication.shared.open(url) }
+            let campaignId = campaign.id
+            DispatchQueue.main.async {
+                LinkRouter.route(url, source: .inApp, campaignId: campaignId) { LinkRouter.openExternally(url) }
+            }
         // The rest of the web bridge (BACKLOG C23, 2026-09-26): a bridge call
         // (from the injected shim, e.g. a `data-joryio-action` button) that
         // records an event or an attribute used to do nothing here.

@@ -207,6 +207,20 @@ public struct JoryioConfig {
     /// was - `.debug` with `enableDebug` and `.error` without.
     public let logLevel: LogLevel
 
+    // Links
+    /// Hand an https link from Joryio content (an in-app message, a
+    /// placement, a card, a push) whose host is one of this app's associated
+    /// domains (`applinks:` entries, `*.shop.com` wildcards included) to the
+    /// app's own universal-link handling - `scene(_:continue:)` or
+    /// `application(_:continue:restorationHandler:)` with an
+    /// `NSUserActivityTypeBrowsingWeb` activity - instead of
+    /// `UIApplication.open`, which usually takes the app's own link out to
+    /// Safari. Off by default. When the entitlements cannot be read the link
+    /// opens as before (logged once). A handler set with
+    /// `Joryio.shared.setLinkHandler` runs first. iOS only: Android routes
+    /// verified App Links to the app by itself.
+    public let forwardUniversalLinks: Bool
+
     public enum TrackingConsent: String {
         case granted
         case denied
@@ -239,7 +253,8 @@ public struct JoryioConfig {
         optOut: Bool = false,
         trackingConsent: TrackingConsent? = nil,
         enableDebug: Bool = false,
-        logLevel: LogLevel? = nil
+        logLevel: LogLevel? = nil,
+        forwardUniversalLinks: Bool = false
     ) {
         self.userId = userId
         self.anonymousId = anonymousId
@@ -260,6 +275,7 @@ public struct JoryioConfig {
         self.trackingConsent = trackingConsent
         self.enableDebug = enableDebug
         self.logLevel = logLevel ?? (enableDebug ? .debug : .error)
+        self.forwardUniversalLinks = forwardUniversalLinks
     }
 }
 

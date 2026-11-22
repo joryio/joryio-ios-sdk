@@ -24,7 +24,7 @@ import Foundation
 /// A display condition the DEVICE evaluates - never an eligibility rule, which
 /// the server already decided by sending the campaign at all.
 public struct InAppTrigger: Codable {
-    /// immediate | event | attribute_change | attribute_threshold | push_notification_tap
+    /// immediate | event | attribute_change | attribute_threshold | push_notification_tap | time_on_screen
     public let type: String
     /// Event name, for `event` triggers.
     public let event: String?
@@ -33,9 +33,12 @@ public struct InAppTrigger: Codable {
     /// Backticked: `operator` is a Swift keyword.
     public let `operator`: String?
     public let value: AnyCodable?
+    /// `time_on_screen` only: the screen it waits on (a `trackScreen` name,
+    /// case-insensitive); nil = any screen. `value` is then the seconds.
+    public let screenName: String?
 
     private enum CodingKeys: String, CodingKey {
-        case type, event, attribute, value
+        case type, event, attribute, value, screenName
         case `operator`
     }
 
@@ -43,12 +46,13 @@ public struct InAppTrigger: Codable {
     /// read. It matches nothing - in particular it is not `immediate`.
     static let unreadableType = "unreadable"
 
-    init(type: String, event: String? = nil, attribute: String? = nil, operator op: String? = nil, value: AnyCodable? = nil) {
+    init(type: String, event: String? = nil, attribute: String? = nil, operator op: String? = nil, value: AnyCodable? = nil, screenName: String? = nil) {
         self.type = type
         self.event = event
         self.attribute = attribute
         self.operator = op
         self.value = value
+        self.screenName = screenName
     }
 
     /**
@@ -64,6 +68,7 @@ public struct InAppTrigger: Codable {
         attribute = try? c.decode(String.self, forKey: .attribute)
         self.operator = try? c.decode(String.self, forKey: .operator)
         value = try? c.decode(AnyCodable.self, forKey: .value)
+        screenName = try? c.decode(String.self, forKey: .screenName)
     }
 }
 

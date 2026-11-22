@@ -41,10 +41,16 @@ public class Joryio {
     private var network: NetworkClient!
     private var queue: QueueManager!
     private var inAppMessaging: InAppMessagingManager!
+    /// Placements: spots inside the app filled per person (PlacementManager.swift).
+    private var placementManager: PlacementManager!
+    /// Content cards: the person's feed (CardManager.swift).
+    private var cardManager: CardManager!
     private var pushNotifications: PushNotificationManager!
     /// Thread-safe holder for the optional SDK-authentication token + handler.
     /// Created at initialize() from config; shared with NetworkClient.
     private var authStore: SdkAuthTokenStore!
+    /// Feature flags + remote config (FlagsManager.swift, BACKLOG D446).
+    private var flagsManager: FlagsManager?
 
     /// Coalescing window for attribute writes; see scheduleAttributeFlush().
     private static let attributeFlushDebounceMs: UInt64 = 800
@@ -608,6 +614,8 @@ public class Joryio {
         self.config = config ?? JoryioConfig()
 
         self.logger = Logger(enabled: self.config.enableDebug, logLevel: self.config.logLevel)
+        LinkRouter.logger = logger
+        LinkRouter.forwardUniversalLinks = self.config.forwardUniversalLinks
         logger.info("Initializing Joryio SDK v\(SDK_VERSION)")
         logger.debug("SDK Key: \(sdkKey)")
         logger.debug("API Endpoint: \(self.apiEndpoint ?? "unknown")")
@@ -724,6 +732,33 @@ public class Joryio {
             ),
             holdInAppMessagesForHandler: inAppConfig.holdInAppMessagesForHandler
         )
+        let placementHtml = inAppConfig.allowHtmlJsInAppMessages
+        self.placementManager = PlacementManager(
+            transport: network,
+            load: { [weak storage = self.storage] in storage?.getValue(forKey: Self.placementsStorageKey(sdkKey: sdkKey)) },
+            save: { [weak storage = self.storage] in storage?.setValue($0, forKey: Self.placementsStorageKey(sdkKey: sdkKey)) },
+            consent: { [weak self] in self?.placementConsent() },
+            userId: { [weak identity = self.identity] in identity?.getUserId() },
+            anonymousId: { [weak identity = self.identity] in identity?.getAnonymousId() ?? "" },
+            sessionId: { [weak session = self.session] in session?.getSessionId() },
+            capabilities: {
+                placementHtml
+                    ? ["placements", "content.native", "content.data", "content.html"]
+                    : ["placements", "content.native", "content.data"]
+            }
+        )
+        self.cardManager = CardManager(
+            transport: network,
+            loadFeed: { [weak storage = self.storage] in storage?.getValue(forKey: Self.cardsStorageKey(sdkKey: sdkKey)) },
+            saveFeed: { [weak storage = self.storage] in storage?.setValue($0, forKey: Self.cardsStorageKey(sdkKey: sdkKey)) },
+            loadDevice: { [weak storage = self.storage] in storage?.getValue(forKey: Self.cardsDeviceStateStorageKey(sdkKey: sdkKey)) },
+            saveDevice: { [weak storage = self.storage] in storage?.setValue($0, forKey: Self.cardsDeviceStateStorageKey(sdkKey: sdkKey)) },
+            consent: { [weak self] in self?.placementConsent() },
+            userId: { [weak identity = self.identity] in identity?.getUserId() },
+            anonymousId: { [weak identity = self.identity] in identity?.getAnonymousId() ?? "" },
+            sessionId: { [weak session = self.session] in session?.getSessionId() },
+            capabilities: { [Cards.capability, "content.native"] }
+        )
         self.pushNotifications = PushNotificationManager(
             networkClient: network,
             identityManager: identity,
@@ -731,6 +766,22 @@ public class Joryio {
             logger: logger,
             inAppMessaging: inAppMessaging
         )
+        self.flagsManager = FlagsManager(FlagsManager.Dependencies(
+            post: { [weak network = self.network] path, body in await network?.postFlags(path: path, body: body) },
+            canSend: { [weak self] in self?.canSend ?? false },
+            userId: { [weak identity = self.identity] in identity?.getUserId() },
+            anonymousId: { [weak identity = self.identity] in identity?.getAnonymousId() ?? "" },
+            sessionId: { [weak session = self.session] in session?.getSessionId() ?? "" },
+            attributes: { [weak identity = self.identity] in identity?.getUserAttributes() ?? [:] },
+            context: { Self.flagsContext() },
+            load: { [weak storage = self.storage] in storage?.getValue(forKey: FlagsManager.storageKey(sdkKey: sdkKey)) },
+            save: { [weak storage = self.storage] in storage?.setValue($0, forKey: FlagsManager.storageKey(sdkKey: sdkKey)) }
+        ))
+        // Not workspace-scoped: another SDK key in this app may have written it.
+        storage.setValue(nil, forKey: FlagsManager.legacyStorageKey)
+        storage.setValue(nil, forKey: Self.legacyPlacementsStorageKey)
+        storage.setValue(nil, forKey: Self.legacyCardsStorageKey)
+        storage.setValue(nil, forKey: Self.legacyCardsDeviceStateStorageKey)
 
         // Route transport outcomes to `lastTransportError`. Set BEFORE any
         // task can use the network (scan 5, N2): they used to be assigned
@@ -925,6 +976,10 @@ public class Joryio {
             await self?.inAppMessaging.syncCampaigns()
         }
 
+        // Flags: the stored answer is readable at once; refreshed now (only
+        // on a device whose app reads flags - nothing is fetched before).
+        flagsManager?.start()
+
         logger.info("SDK initialized successfully")
 
         // Retired tokens whose user has nothing left on the device (D-a).
@@ -945,6 +1000,21 @@ public class Joryio {
 
     /// Where the write outbox is persisted (StorageManager key-value table).
     static let outboxStorageKey = "write_outbox"
+    /// The last placement answers, per person (PlacementManager.swift) and per
+    /// workspace: the key carries the SDK key like the flags cache
+    /// (FlagsManager.storageKey), because the kv table is one database per app.
+    static func placementsStorageKey(sdkKey: String) -> String { "jry_\(sdkKey)_placements_cache" }
+    /// The unscoped key of builds before 2026-11-21: never read, removed at start.
+    static let legacyPlacementsStorageKey = "placements_cache"
+    /// The last card feed, per person (CardManager.swift) and per workspace,
+    /// like the placements cache above: the key carries the SDK key.
+    static func cardsStorageKey(sdkKey: String) -> String { "jry_\(sdkKey)_cards_cache" }
+    /// An anonymous visitor's read / dismissed card ids (`stateScope: "device"`), per
+    /// workspace; cleared on identify / reset.
+    static func cardsDeviceStateStorageKey(sdkKey: String) -> String { "jry_\(sdkKey)_cards_device_state" }
+    /// The unscoped keys of builds before 2026-11-21: never read, removed at start.
+    static let legacyCardsStorageKey = "cards_cache"
+    static let legacyCardsDeviceStateStorageKey = "cards_device_state"
 
     /// Has the device been unlocked since it started? See the class doc and
     /// `KeychainHelper.isProtectedDataAvailable()`: the same Keychain probe on
@@ -1072,6 +1142,13 @@ public class Joryio {
         // the event is queued: the event is data and must be recorded whether
         // or not it triggers a message.
         inAppMessaging?.onEventTracked(eventName, properties: properties)
+        placementManager?.onEventTracked(eventName, properties: properties)
+        // A screen view also moves the time_on_screen clock (ScreenClock.swift) -
+        // from the event, so a queued trackScreen replayed after initialize()
+        // and a hand-written track("Screen Viewed") count too.
+        if eventName == "Screen Viewed", let screen = properties["screen_name"] as? String {
+            inAppMessaging?.screenViewed(screen)
+        }
     }
 
     // MARK: Event limits - the backend's, published in its batch contract
@@ -1193,6 +1270,11 @@ public class Joryio {
         // A sync already in flight, and a display waiting on its delay, were
         // for the previous identity (SDK contract 26, v4 43).
         inAppMessaging.invalidate()
+        placementManager?.invalidate()
+        // A new person: the anonymous visitor's read / dismissed state goes too.
+        cardManager?.invalidate(clearDeviceState: true)
+        // Flags: the held answer was the previous identity's.
+        flagsManager?.onIdentityChanged()
 
         // Re-register the stored device token against the new identity so a
         // token first captured while anonymous becomes bound to this user.
@@ -1551,6 +1633,10 @@ public class Joryio {
         // The next user never sees the previous user's campaigns, and nothing
         // scheduled for the previous user fires.
         inAppMessaging.clear()
+        placementManager?.invalidate()
+        cardManager?.invalidate(clearDeviceState: true)
+        // Nor the previous user's flags; their unsent exposures go as them.
+        flagsManager?.onIdentityChanged()
 
         // Now send what the outgoing identity left queued.
         queue.flushSync()
@@ -1889,6 +1975,10 @@ public class Joryio {
         // delay is not shown (v4, 43).
         discardCollectedData(owesSessionStart: true)
         inAppMessaging.invalidate()
+        placementManager?.invalidate()
+        cardManager?.invalidate(clearDeviceState: false)
+        // Flags: unsent exposures are dropped; the getters answer the defaults.
+        flagsManager?.onIdentityChanged()
 
         // The consent RECORD - not tracking: the only way the server learns
         // the person opted out on this device.
@@ -1987,11 +2077,14 @@ public class Joryio {
         // users' anonymous ids goes with the wipe, the same on all five SDKs.
         storage.clearSignedInAnonymousIds()
         inAppMessaging.clear()
+        placementManager?.invalidate()
+        cardManager?.invalidate(clearDeviceState: true)
         // The anonymous id too, in storage AND in memory - it is the key the
         // erased profile was filed under. Clear storage first, then let the
         // identity manager mint the replacement.
         storage.clearAnonymousId()
         identity.onDataWiped()
+        flagsManager?.wipe()
         session.resetSession()
         // The new session is the new anonymous id's: announced by the next
         // event (or foreground), as Android does by ending the session. It
@@ -2034,6 +2127,9 @@ public class Joryio {
             return
         }
         inAppMessaging.invalidate()
+        placementManager?.invalidate()
+        cardManager?.invalidate(clearDeviceState: false)
+        flagsManager?.onIdentityChanged()
         releaseOwedSessionStart()
         resumeSending()
     }
@@ -2135,7 +2231,13 @@ public class Joryio {
         let previous = self.consent
         self.consent = consent
         logger.info("Tracking consent \(previous.rawValue) -> \(consent.rawValue)")
-        if previous != consent { inAppMessaging.invalidate() }
+        if previous != consent {
+            inAppMessaging.invalidate()
+            placementManager?.invalidate()
+            cardManager?.invalidate(clearDeviceState: false)
+            // Flags: a withdrawal drops unsent exposures; a grant fetches.
+            flagsManager?.onIdentityChanged()
+        }
 
         switch consent {
         case .denied:
@@ -2484,6 +2586,134 @@ public class Joryio {
         await inAppMessaging?.onPushTapped()
     }
 
+    // MARK: - Placements (docs/PLACEMENTS_PLAN.md, D444)
+
+    /// What a placement request may carry (plan 3.9): nil = nothing may be
+    /// sent; `granted` = the person is named and their interactions reported;
+    /// `pending` / `denied` (opted out included) = an anonymous request for
+    /// content meant for everyone, nothing reported.
+    private func placementConsent() -> String? {
+        guard isInitialized else { return nil }
+        if canSend { return "granted" }
+        return locked { !_isOptedOut && _consent == .pending } ? "pending" : "denied"
+    }
+
+    /**
+     The placements for `placementKeys`, to draw with your own UI; `completion`
+     runs on the main thread. Report what the person did with
+     `item.markDisplayed()` (once at least half of it was on screen for
+     `InAppDisplay.IN_APP_DISPLAY_DWELL_MS`), `item.markClicked()` and
+     `item.markDismissed()`; for a held-out person (`isControl`),
+     `placement.markDisplayed()` when the empty spot was on screen.
+     */
+    public func getPlacements(_ placementKeys: [String], completion: @escaping ([String: Placement]) -> Void) {
+        guard isInitialized, let placementManager else {
+            DispatchQueue.main.async { completion([:]) }
+            return
+        }
+        placementManager.getPlacements(placementKeys, completion: completion)
+    }
+
+    /// `getPlacements(_:completion:)` for async code.
+    public func getPlacements(_ placementKeys: [String]) async -> [String: Placement] {
+        guard isInitialized, let placementManager else { return [:] }
+        return await placementManager.getPlacements(placementKeys)
+    }
+
+    /// Ask the server again for `placementKeys` (nil = every placement on screen or cached).
+    /// At most once per key per `Placements.PLACEMENT_MIN_REFRESH_SECONDS`; extra calls coalesce.
+    public func refreshPlacements(_ placementKeys: [String]? = nil) {
+        guard isInitialized else { return }
+        placementManager?.refreshPlacements(placementKeys)
+    }
+
+    /// Called on the main thread with the placements whose content changed. `cancel()` the result to stop.
+    @discardableResult
+    public func onPlacementsUpdated(_ listener: @escaping ([String: Placement]) -> Void) -> PlacementsSubscription {
+        guard let placementManager else { return PlacementsSubscription {} }
+        return placementManager.onPlacementsUpdated(listener)
+    }
+
+    /// For Joryio's own placement views (PlacementView, the React Native view).
+    /// Returns false before `initialize()` (the view tries again).
+    @discardableResult
+    public func attachPlacementHost(_ host: PlacementHost) -> Bool {
+        guard isInitialized, let placementManager else { return false }
+        placementManager.attach(host)
+        return true
+    }
+
+    /// For Joryio's own placement views.
+    public func detachPlacementHost(_ host: PlacementHost) {
+        placementManager?.detach(host)
+    }
+
+    // MARK: - Content cards (docs/PLACEMENTS_PLAN.md section 11, D444)
+
+    /**
+     The person's card feed - pinned first, newest first - with the unread
+     count for a badge. Served from the cache for `Cards.CARD_FEED_TTL_SECONDS`;
+     `completion` runs on the main thread. Pass a feed's `nextCursor` as
+     `cursor` for the next page (it is added to the cached feed). Draw it with
+     `CardFeedViewController` / `JoryioCardFeed`, or yourself and report with
+     `markCardViewed`, `markCardRead`, `markCardClicked` and `dismissCard`.
+     */
+    public func getCards(cursor: String? = nil, completion: @escaping (CardFeed) -> Void) {
+        guard isInitialized, let cardManager else {
+            DispatchQueue.main.async { completion(.empty) }
+            return
+        }
+        cardManager.getCards(cursor: cursor, completion: completion)
+    }
+
+    /// `getCards(cursor:completion:)` for async code.
+    public func getCards(cursor: String? = nil) async -> CardFeed {
+        guard isInitialized, let cardManager else { return .empty }
+        return await cardManager.getCards(cursor: cursor)
+    }
+
+    /// Unread cards, from the cache (never a network call): the badge.
+    public func getUnreadCardCount() -> Int {
+        cardManager?.getUnreadCardCount() ?? 0
+    }
+
+    /// The card was on screen (`viewed`). Once per card; the feed views do it themselves.
+    public func markCardViewed(_ card: Card) { cardManager?.markCardViewed(card.id, token: card.deliveryToken) }
+    public func markCardViewed(_ cardId: String) { cardManager?.markCardViewed(cardId) }
+
+    /// The person read the card (`read`): it stops counting as unread at once.
+    public func markCardRead(_ card: Card) { cardManager?.markCardRead(card.id, token: card.deliveryToken) }
+    public func markCardRead(_ cardId: String) { cardManager?.markCardRead(cardId) }
+
+    /// The person tapped the card or its button (`clicked`, which also marks it read). Open its url yourself.
+    public func markCardClicked(_ card: Card) { cardManager?.markCardClicked(card.id, token: card.deliveryToken) }
+    public func markCardClicked(_ cardId: String) { cardManager?.markCardClicked(cardId) }
+
+    /// The person removed the card (`dismissed`): it leaves the feed at once and never comes back.
+    public func dismissCard(_ card: Card) { cardManager?.dismissCard(card.id, token: card.deliveryToken) }
+    public func dismissCard(_ cardId: String) { cardManager?.dismissCard(cardId) }
+
+    /// Ask the server for the feed again. At most once per `Cards.CARD_MIN_REFRESH_SECONDS`;
+    /// extra calls coalesce into one at the end of that window.
+    public func refreshCards() {
+        guard isInitialized else { return }
+        cardManager?.refreshCards()
+    }
+
+    /// Called on the main thread with the whole feed whenever it changes. `cancel()` the result to stop.
+    @discardableResult
+    public func onCardsUpdated(_ listener: @escaping (CardFeed) -> Void) -> CardsSubscription {
+        guard let cardManager else { return CardsSubscription {} }
+        return cardManager.onCardsUpdated(listener)
+    }
+
+    /// For Joryio's own card feed views (CardFeedViewController, the React
+    /// Native view): nil before `initialize()` (the view tries again).
+    public func attachCardFeedListener(_ listener: @escaping (CardFeed) -> Void) -> CardsSubscription? {
+        guard isInitialized, let cardManager else { return nil }
+        return cardManager.onCardsUpdated(listener)
+    }
+
     /// Fetch in-app campaigns now, bypassing the automatic-sync interval.
     public func syncInAppCampaigns() async {
         guard isInitialized else {
@@ -2552,6 +2782,32 @@ public class Joryio {
             callback(campaign)
             self?.warnIfInAppNeverReported()
         }, capabilities: capabilities)
+    }
+
+    // MARK: - Links
+
+    /// Receive EVERY link the SDK is about to open - an in-app message
+    /// button or link, a placement button, a card tap, a push tap - before it
+    /// opens: http(s) links and app deep links (`myapp://cart`) alike, with
+    /// where it came from (`link.source`: in_app, placement, card, push) and
+    /// the ids that go with it.
+    ///
+    /// Return true to take the link over (route it in your app), false to let
+    /// the SDK do what it does without a handler: open http(s) (through your
+    /// universal-link handling with `JoryioConfig.forwardUniversalLinks`) and
+    /// hand an app deep link to the view's `onDeepLink`, as before. To decide
+    /// later, return true and call `link.openDefault()` when you decline.
+    /// A refused scheme (`javascript:`, `data:`, `file:`, ...) never reaches
+    /// the handler. Called on the main thread. Safe before `initialize()`.
+    /// Same name on Android, React Native, Unity (`SetLinkHandler`) and web.
+    public func setLinkHandler(_ handler: @escaping JoryioLinkHandler) {
+        LinkRouter.handler = handler
+    }
+
+    /// Remove the handler set with `setLinkHandler(_:)`: links open as they
+    /// do without one.
+    public func clearLinkHandler() {
+        LinkRouter.handler = nil
     }
 
     /// Hand in-app display back to the SDK: removes the callback set with
@@ -3015,6 +3271,89 @@ public class Joryio {
         pushNotifications.unregister()
     }
 
+    // MARK: - Feature flags (BACKLOG D446)
+
+    /// Device context sent with every flags request; matched by attribute rules.
+    static func flagsContext() -> [String: Any] {
+        var context: [String: Any] = ["platform": "ios"]
+        if let locale = Locale.preferredLanguages.first { context["locale"] = locale }
+        if let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+            context["appVersion"] = appVersion
+        }
+        return context
+    }
+
+    /**
+     A flag's value for this person, or `defaultValue` before the first answer,
+     for a flag Joryio did not send, or without tracking consent. Never waits
+     for the network. The first read of a value in a session logs an exposure.
+     A JSON `null` reads as `nil`.
+     */
+    public func getFlag(_ key: String, default defaultValue: Any?) -> Any? {
+        guard isInitialized, let flagsManager else { return defaultValue }
+        return flagsManager.getFlag(key, default: defaultValue)
+    }
+
+    /// A boolean flag, or `defaultValue` (also for a flag of another type).
+    public func getBoolFlag(_ key: String, default defaultValue: Bool) -> Bool {
+        guard isInitialized, let flagsManager else { return defaultValue }
+        return flagsManager.getBoolFlag(key, default: defaultValue)
+    }
+
+    /// A string flag, or `defaultValue`.
+    public func getStringFlag(_ key: String, default defaultValue: String) -> String {
+        guard isInitialized, let flagsManager else { return defaultValue }
+        return flagsManager.getStringFlag(key, default: defaultValue)
+    }
+
+    /// A number flag, or `defaultValue`.
+    public func getNumberFlag(_ key: String, default defaultValue: Double) -> Double {
+        guard isInitialized, let flagsManager else { return defaultValue }
+        return flagsManager.getNumberFlag(key, default: defaultValue)
+    }
+
+    /// A JSON flag (dictionary, array or scalar, as `JSONSerialization` reads it), or `defaultValue`.
+    public func getJsonFlag(_ key: String, default defaultValue: Any?) -> Any? {
+        guard isInitialized, let flagsManager else { return defaultValue }
+        return flagsManager.getJsonFlag(key, default: defaultValue)
+    }
+
+    /// A JSON flag decoded into `T`, or `defaultValue` when it is missing or does not decode.
+    public func getJsonFlag<T: Decodable>(_ key: String, as type: T.Type, default defaultValue: T) -> T {
+        guard isInitialized, let flagsManager else { return defaultValue }
+        return flagsManager.getJsonFlag(key, as: type, default: defaultValue)
+    }
+
+    /// Every flag held for this person, key -> value (`NSNull` for a JSON null). Logs no exposure.
+    public func getAllFlags() -> [String: Any] {
+        guard isInitialized, let flagsManager else { return [:] }
+        return flagsManager.getAllFlags()
+    }
+
+    /// Fetch the flags now. Returns when the answer is in (or the request failed: the held flags stay).
+    public func refreshFlags() async {
+        guard isInitialized, let flagsManager else { return }
+        await flagsManager.refreshFlags()
+    }
+
+    /// `refreshFlags()` with a completion, called on the main thread.
+    public func refreshFlags(completion: @escaping () -> Void) {
+        Task {
+            await refreshFlags()
+            DispatchQueue.main.async { completion() }
+        }
+    }
+
+    /// Called on the main thread with the keys whose value changed. `cancel()` the result to stop.
+    @discardableResult
+    public func onFlagsUpdated(_ callback: @escaping ([String]) -> Void) -> FlagsSubscription {
+        guard isInitialized, let flagsManager else {
+            logger?.error("onFlagsUpdated() before initialize(): not registered")
+            return FlagsSubscription {}
+        }
+        return flagsManager.onFlagsUpdated(callback)
+    }
+
     // MARK: - Lifecycle Observers
 
     private func setupLifecycleObservers() {
@@ -3059,6 +3398,11 @@ public class Joryio {
         // No-op when the backend already confirmed this token.
         pushNotifications.retryRegistrationIfUnconfirmed()
 
+        // Placements on screen whose answer outlived its TTL.
+        placementManager?.onForeground()
+        // The card feed, when the app reads it and its TTL passed.
+        cardManager?.onForeground()
+
         // identify / addAlias / subscription changes that failed last time.
         retryOwedRequests()
 
@@ -3076,6 +3420,9 @@ public class Joryio {
             await flushPendingAttributes()
             await inAppMessaging.syncCampaigns()
         }
+
+        // Flags: at most once per JoryioFlags.FLAGS_MIN_REFRESH_SECONDS.
+        flagsManager?.onForeground()
     }
 
     private func onAppTerminating() {

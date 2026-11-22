@@ -94,6 +94,11 @@ class InAppMessagingManager {
     private var deferredForStability: String?
     private var lifecycleObservers: [NSObjectProtocol] = []
 
+    /// The clock behind `time_on_screen` triggers (ScreenClock.swift).
+    var screenClock = ScreenClock()
+    /// The pending time_on_screen check, on the main queue.
+    private var screenCheck: DispatchWorkItem?
+
     /// Dwell length in seconds. A seam for tests; the rule is the constant.
     var displayDwellSeconds: TimeInterval = Double(InAppDisplay.IN_APP_DISPLAY_DWELL_MS) / 1000
     /// How long to wait for the screen to settle before giving up (the
@@ -214,10 +219,15 @@ class InAppMessagingManager {
 
     func appLeftForeground() {
         withState { dwellToken += 1 }
+        // Background time does not count toward time_on_screen.
+        screenClock.pause()
+        cancelScreenCheck()
     }
 
     func appBecameActive() {
         startDwell()
+        screenClock.resume()
+        scheduleScreenCheck()
         let deferred = withState { () -> String? in
             defer { deferredForStability = nil }
             return deferredForStability
@@ -319,9 +329,15 @@ class InAppMessagingManager {
                 // picture cannot drift from what this manager will actually do
                 // when a campaign arrives. hostCapabilities wins when a host
                 // renders: the list below describes THIS SDK's views.
-                capabilities: hostCapabilities ?? (allowHtmlJsInAppMessages
-                    ? ["content.native", "content.html"]
-                    : ["content.native"])
+                // `placements` + `content.data`: this build draws placements and
+                // hands their data to the app; `cards`: it reads the card feed -
+                // the words every SDK sends.
+                // `screen_context`: this manager runs the screen clock for
+                // `time_on_screen` triggers - also when a host draws, because
+                // the triggers are still evaluated here.
+                capabilities: Self.withScreenContext(hostCapabilities ?? (allowHtmlJsInAppMessages
+                    ? ["content.native", "placements", "content.data", "cards", "content.html"]
+                    : ["content.native", "placements", "content.data", "cards"]))
             )
 
             logger.debug("Syncing in-app campaigns...")
@@ -354,6 +370,7 @@ class InAppMessagingManager {
                 logger.info("Synced \(response.campaigns.count) in-app campaigns")
 
                 await evaluateAndDisplay()
+                scheduleScreenCheck()
             } else {
                 logger.error("Campaign sync failed: \(response.error ?? "Unknown error")")
             }
@@ -1448,18 +1465,19 @@ extension InAppMessagingManager: InAppMessageViewDelegate {
             await countAsDisplayed(campaignId)
             await trackImpression(campaignId: campaignId, kind: .click, elementId: action)
 
-            // http(s) only - the view already filtered, this is defence in
-            // depth. `javascript:`/`data:`/`file:` URLs are how authored
-            // content escapes its container.
-            guard
-                let urlString = url,
-                let target = URL(string: urlString),
-                let scheme = target.scheme?.lowercased(),
-                scheme == "http" || scheme == "https"
-            else { return }
+            // http(s) or an app deep link, through the app's link handler
+            // first (`setLinkHandler`). `javascript:`/`data:`/`file:` URLs are
+            // how authored content escapes its container: LinkRouter refuses
+            // them before any handler sees them. Without a handler (or when it
+            // declines) http(s) opens as before and an app deep link, which
+            // an in-app message has no `onDeepLink` for, is not opened.
+            guard let urlString = url?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let target = URL(string: urlString) else { return }
 
             await MainActor.run {
-                UIApplication.shared.open(target)
+                _ = LinkRouter.route(target, source: .inApp, campaignId: campaignId) {
+                    LinkRouter.openExternally(target)
+                }
             }
         }
     }
@@ -1480,6 +1498,80 @@ public protocol InAppMessageViewDelegate: AnyObject {
 // MARK: - Triggers
 
 extension InAppMessagingManager {
+    /// The /sync capability list plus `screen_context`, once.
+    static func withScreenContext(_ capabilities: [String]) -> [String] {
+        capabilities.contains(ScreenClock.capability) ? capabilities : capabilities + [ScreenClock.capability]
+    }
+
+    /**
+     The app reported a screen (`trackScreen` -> `Screen Viewed`). A new
+     screen restarts the time_on_screen clock and re-arms every campaign
+     waiting on it; the same screen again changes nothing.
+     */
+    func screenViewed(_ screenName: String) {
+        guard screenClock.enter(screenName) else { return }
+        scheduleScreenCheck()
+    }
+
+    private func cancelScreenCheck() {
+        let pending: DispatchWorkItem? = withState {
+            defer { screenCheck = nil }
+            return screenCheck
+        }
+        pending?.cancel()
+    }
+
+    /// Seconds still to wait for the nearest time_on_screen trigger on this screen, nil = none waits.
+    func nextScreenDeadline() -> TimeInterval? {
+        guard enabled, screenClock.isVisible else { return nil }
+        let elapsed = screenClock.seconds
+        let current = screenClock.name
+        var next: TimeInterval?
+        for campaign in withState({ activeCampaigns }) where !screenClock.hasFired(campaign.id) {
+            for t in campaign.triggers ?? [] {
+                guard let need = ScreenClock.thresholdSeconds(t),
+                      ScreenClock.screenNameMatches(t.screenName, current) else { continue }
+                let wait = max(0, need - elapsed)
+                next = min(next ?? wait, wait)
+            }
+        }
+        return next
+    }
+
+    /// Arm one timer for the nearest time_on_screen deadline (none while backgrounded).
+    func scheduleScreenCheck() {
+        cancelScreenCheck()
+        guard let wait = nextScreenDeadline() else { return }
+        let work = DispatchWorkItem { [weak self] in self?.screenCheckDue() }
+        withState { screenCheck = work }
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait + 0.05, execute: work)
+    }
+
+    /**
+     The campaigns whose time_on_screen is reached now, on this screen, and not
+     yet fired for this visit - marked fired, and shown through the ONE display
+     path (slot, gap, caps), like every other trigger.
+     */
+    @discardableResult
+    func screenCheckDue() -> [String] {
+        guard enabled, screenClock.isVisible else { return [] }
+        let elapsed = screenClock.seconds
+        let current = screenClock.name
+        let due = withState({ activeCampaigns }).filter { campaign in
+            !screenClock.hasFired(campaign.id) && (campaign.triggers ?? []).contains { t in
+                guard let need = ScreenClock.thresholdSeconds(t) else { return false }
+                return ScreenClock.screenNameMatches(t.screenName, current) && elapsed + 0.001 >= need
+            }
+        }.map(\.id)
+        due.forEach { screenClock.markFired($0) }
+        if !due.isEmpty {
+            let ids = Set(due)
+            Task { [weak self] in await self?.displayFirstEligible(from: { ids.contains($0.id) }) }
+        }
+        scheduleScreenCheck()
+        return due
+    }
+
     /**
      The user just tapped a push - show anything waiting on that.
 
