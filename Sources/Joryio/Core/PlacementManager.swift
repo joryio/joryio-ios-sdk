@@ -188,10 +188,10 @@ final class PlacementManager: PlacementReporter {
         if !wanted.isEmpty { fetchKeys(wanted, force: true) {} }
     }
 
-    func onPlacementsUpdated(_ listener: @escaping ([String: Placement]) -> Void) -> PlacementsSubscription {
+    func onPlacementsUpdated(_ listener: @escaping ([String: Placement]) -> Void) -> JoryioSubscription {
         let id = UUID()
         locked { listeners[id] = listener }
-        return PlacementsSubscription { [weak self] in
+        return JoryioSubscription { [weak self] in
             self?.locked { self?.listeners[id] = nil }
         }
     }

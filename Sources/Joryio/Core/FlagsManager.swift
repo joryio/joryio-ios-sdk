@@ -38,23 +38,6 @@ public enum JoryioFlags {
     static let FLAG_EXPOSURES_PER_CALL_MAX = 100
 }
 
-/// Returned by `onFlagsUpdated`; `cancel()` stops the callbacks.
-public final class FlagsSubscription {
-    private let onCancel: () -> Void
-    private let lock = NSLock()
-    private var cancelled = false
-
-    init(_ onCancel: @escaping () -> Void) { self.onCancel = onCancel }
-
-    public func cancel() {
-        lock.lock()
-        let first = !cancelled
-        cancelled = true
-        lock.unlock()
-        if first { onCancel() }
-    }
-}
-
 final class FlagsManager {
     /// The network: POST a JSON body, answer the decoded JSON object or nil.
     typealias Post = (_ path: String, _ body: Data) async -> [String: Any]?
@@ -209,11 +192,11 @@ final class FlagsManager {
         await refresh(force: true)
     }
 
-    func onFlagsUpdated(_ callback: @escaping ([String]) -> Void) -> FlagsSubscription {
+    func onFlagsUpdated(_ callback: @escaping ([String]) -> Void) -> JoryioSubscription {
         let id = UUID()
         withLock { listeners[id] = callback }
         use()
-        return FlagsSubscription { [weak self] in
+        return JoryioSubscription { [weak self] in
             guard let self else { return }
             self.withLock { _ = self.listeners.removeValue(forKey: id) }
         }

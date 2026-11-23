@@ -150,13 +150,13 @@ final class CardManager {
         fetch(force: true) {}
     }
 
-    func onCardsUpdated(_ listener: @escaping (CardFeed) -> Void) -> CardsSubscription {
+    func onCardsUpdated(_ listener: @escaping (CardFeed) -> Void) -> JoryioSubscription {
         let id = UUID()
         locked {
             used = true
             listeners[id] = listener
         }
-        return CardsSubscription { [weak self] in
+        return JoryioSubscription { [weak self] in
             self?.locked { self?.listeners[id] = nil }
         }
     }

@@ -203,7 +203,7 @@ final class CardManagerTests: XCTestCase {
         let m = manager(t)
         _ = await m.getCards()
         var updates: [CardFeed] = []
-        let sub = m.onCardsUpdated { updates.append($0) }
+        let sub: JoryioSubscription = m.onCardsUpdated { updates.append($0) }
         m.markCardRead("a")
         XCTAssertEqual(m.getUnreadCardCount(), 2)
         XCTAssertEqual(m.view().cards.first { $0.id == "a" }?.read, true)
@@ -218,6 +218,28 @@ final class CardManagerTests: XCTestCase {
         XCTAssertEqual(updates.count, 3)
         XCTAssertEqual(updates.last?.unreadCount, 0)
         sub.cancel()
+        // A cancelled JoryioSubscription hears nothing more; a second cancel() is harmless.
+        sub.cancel()
+        m.markCardClicked("a")
+        XCTAssertEqual(updates.count, 3)
+    }
+
+    /// The SwiftUI feed takes the same labels as CardFeedViewController (and
+    /// Android's CardFeedView / JoryioCardFeed, web's mountCardFeed, React
+    /// Native's <JoryioCardFeed />), so a localized app can translate them.
+    func testTheSwiftUIFeedPassesEveryLabelToTheController() {
+        let feed = JoryioCardFeed(emptyText: "Rien", pinnedLabel: "Epingle", dismissLabel: "Fermer", unreadLabel: "Non lu")
+        let vc = CardFeedViewController()
+        feed.apply(to: vc)
+        XCTAssertEqual(vc.emptyText, "Rien")
+        XCTAssertEqual(vc.pinnedLabel, "Epingle")
+        XCTAssertEqual(vc.dismissLabel, "Fermer")
+        XCTAssertEqual(vc.unreadLabel, "Non lu")
+        let defaults = CardFeedViewController()
+        JoryioCardFeed().apply(to: defaults)
+        XCTAssertEqual(defaults.pinnedLabel, "Pinned")
+        XCTAssertEqual(defaults.dismissLabel, "Dismiss")
+        XCTAssertEqual(defaults.unreadLabel, "Unread")
     }
 
     func testAnAnonymousVisitorsReadAndDismissedStayOnTheDeviceUntilReset() async {

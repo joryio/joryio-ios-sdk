@@ -102,6 +102,27 @@ final class PlacementManagerTests: XCTestCase {
         XCTAssertEqual(bridged?.first?["compareAtPrice"] as? String, "$10")
     }
 
+    /// onPlacementsUpdated answers the one JoryioSubscription every listener of
+    /// every Joryio SDK returns: cancel() stops it, twice is harmless.
+    func testOnPlacementsUpdatedAnswersAJoryioSubscriptionWhoseCancelStopsTheUpdates() async {
+        var itemId = "camp-1"
+        let t = FakeTransport { _ in self.answer(self.hero(self.item(itemId))) }
+        let m = manager(t)
+        var heard = 0
+        let sub: JoryioSubscription = m.onPlacementsUpdated { _ in heard += 1 }
+        _ = await m.getPlacements(["home_hero"])
+        await settle()
+        XCTAssertEqual(heard, 1)
+        sub.cancel()
+        sub.cancel()
+        itemId = "camp-2"
+        clock += 300
+        _ = await m.getPlacements(["home_hero"])
+        await settle()
+        XCTAssertEqual(t.fetches.count, 2)
+        XCTAssertEqual(heard, 1)
+    }
+
     func testServesTheCacheForTtlAndRateLimitsRefreshes() async {
         let t = FakeTransport { _ in self.answer(self.hero()) }
         let m = manager(t)

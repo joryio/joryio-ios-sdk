@@ -154,12 +154,3 @@ public struct CardFeed: Equatable {
     }
 }
 
-/// Returned by `onCardsUpdated`: `cancel()` stops the updates.
-public final class CardsSubscription {
-    private var onCancel: (() -> Void)?
-    init(_ onCancel: @escaping () -> Void) { self.onCancel = onCancel }
-    public func cancel() {
-        onCancel?()
-        onCancel = nil
-    }
-}

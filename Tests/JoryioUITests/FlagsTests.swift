@@ -238,7 +238,7 @@ final class FlagsTests: XCTestCase {
         server.answer = Self.answer
         let lock = NSLock()
         var received: [[String]] = []
-        let sub = m.onFlagsUpdated { keys in lock.lock(); received.append(keys); lock.unlock() }
+        let sub: JoryioSubscription = m.onFlagsUpdated { keys in lock.lock(); received.append(keys); lock.unlock() }
         waitUntil(timeout: 2) { lock.lock(); defer { lock.unlock() }; return received.count == 1 }
         lock.lock(); XCTAssertEqual(received.first?.count, 5); lock.unlock()
         var next = Self.answer

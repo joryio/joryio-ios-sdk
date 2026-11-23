@@ -234,13 +234,3 @@ public protocol PlacementHost: AnyObject {
     func clearPlacement()
 }
 
-/// Returned by `onPlacementsUpdated`: `cancel()` stops the updates.
-public final class PlacementsSubscription {
-    private var onCancel: (() -> Void)?
-    init(_ onCancel: @escaping () -> Void) { self.onCancel = onCancel }
-    public func cancel() {
-        onCancel?()
-        onCancel = nil
-    }
-    deinit { }
-}

@@ -50,7 +50,7 @@ public final class CardFeedViewController: UIViewController {
     private let scrollView = UIScrollView()
     private let stack = UIStackView()
     private let viewability = ViewabilityTracker()
-    private var subscription: CardsSubscription?
+    private var subscription: JoryioSubscription?
     private var feed: CardFeed = .empty
     private var timer: Timer?
     private var loadingMore = false
@@ -293,28 +293,48 @@ private final class CardRowView: UIStackView {
  link rule - so a SwiftUI screen and a UIKit screen behave identically.
  */
 public struct JoryioCardFeed: UIViewControllerRepresentable {
+    /// Replaces "No messages yet".
     public var emptyText: String?
+    /// Replaces "Pinned" (the marker on a pinned card).
+    public var pinnedLabel: String?
+    /// Replaces "Dismiss" (the accessible label of the dismiss control).
+    public var dismissLabel: String?
+    /// Replaces "Unread" (the accessible label of the unread dot).
+    public var unreadLabel: String?
     public var onDeepLink: ((URL, Card) -> Void)?
     public var onRender: ((CardFeed) -> Void)?
 
-    public init(emptyText: String? = nil, onDeepLink: ((URL, Card) -> Void)? = nil, onRender: ((CardFeed) -> Void)? = nil) {
+    public init(
+        emptyText: String? = nil,
+        pinnedLabel: String? = nil,
+        dismissLabel: String? = nil,
+        unreadLabel: String? = nil,
+        onDeepLink: ((URL, Card) -> Void)? = nil,
+        onRender: ((CardFeed) -> Void)? = nil
+    ) {
         self.emptyText = emptyText
+        self.pinnedLabel = pinnedLabel
+        self.dismissLabel = dismissLabel
+        self.unreadLabel = unreadLabel
         self.onDeepLink = onDeepLink
         self.onRender = onRender
     }
 
     public func makeUIViewController(context: Context) -> CardFeedViewController {
         let vc = CardFeedViewController()
-        update(vc)
+        apply(to: vc)
         return vc
     }
 
     public func updateUIViewController(_ vc: CardFeedViewController, context: Context) {
-        update(vc)
+        apply(to: vc)
     }
 
-    private func update(_ vc: CardFeedViewController) {
+    func apply(to vc: CardFeedViewController) {
         if let emptyText, vc.emptyText != emptyText { vc.emptyText = emptyText }
+        if let pinnedLabel { vc.pinnedLabel = pinnedLabel }
+        if let dismissLabel { vc.dismissLabel = dismissLabel }
+        if let unreadLabel { vc.unreadLabel = unreadLabel }
         vc.onDeepLink = onDeepLink
         vc.onRender = onRender
     }

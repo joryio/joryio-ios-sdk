@@ -2629,8 +2629,11 @@ public class Joryio {
 
     /// Called on the main thread with the placements whose content changed. `cancel()` the result to stop.
     @discardableResult
-    public func onPlacementsUpdated(_ listener: @escaping ([String: Placement]) -> Void) -> PlacementsSubscription {
-        guard let placementManager else { return PlacementsSubscription {} }
+    public func onPlacementsUpdated(_ listener: @escaping ([String: Placement]) -> Void) -> JoryioSubscription {
+        guard isInitialized, let placementManager else {
+            logger?.error("onPlacementsUpdated() before initialize(): not registered")
+            return JoryioSubscription {}
+        }
         return placementManager.onPlacementsUpdated(listener)
     }
 
@@ -2700,16 +2703,26 @@ public class Joryio {
         cardManager?.refreshCards()
     }
 
-    /// Called on the main thread with the whole feed whenever it changes. `cancel()` the result to stop.
+    /// Called on the main thread with the whole feed whenever it changes - the
+    /// way to keep a feed UI of your own up to date. `cancel()` the result to
+    /// stop (a `JoryioSubscription`, the same name and `cancel()` on every
+    /// Joryio SDK). Call it after `initialize()`; before, nothing is registered.
     @discardableResult
-    public func onCardsUpdated(_ listener: @escaping (CardFeed) -> Void) -> CardsSubscription {
-        guard let cardManager else { return CardsSubscription {} }
+    public func onCardsUpdated(_ listener: @escaping (CardFeed) -> Void) -> JoryioSubscription {
+        guard isInitialized, let cardManager else {
+            logger?.error("onCardsUpdated() before initialize(): not registered")
+            return JoryioSubscription {}
+        }
         return cardManager.onCardsUpdated(listener)
     }
 
-    /// For Joryio's own card feed views (CardFeedViewController, the React
-    /// Native view): nil before `initialize()` (the view tries again).
-    public func attachCardFeedListener(_ listener: @escaping (CardFeed) -> Void) -> CardsSubscription? {
+    /// SDK-internal (SPI): for Joryio's own card feed views and bridges
+    /// (CardFeedViewController, the React Native and Unity bridges). nil
+    /// before `initialize()`, so the caller tries again. An app uses
+    /// `onCardsUpdated` - the one listener every Joryio SDK has; Android, web,
+    /// React Native and Unity have no public equivalent of this either.
+    @_spi(JoryioInternal)
+    public func attachCardFeedListener(_ listener: @escaping (CardFeed) -> Void) -> JoryioSubscription? {
         guard isInitialized, let cardManager else { return nil }
         return cardManager.onCardsUpdated(listener)
     }
@@ -3346,10 +3359,10 @@ public class Joryio {
 
     /// Called on the main thread with the keys whose value changed. `cancel()` the result to stop.
     @discardableResult
-    public func onFlagsUpdated(_ callback: @escaping ([String]) -> Void) -> FlagsSubscription {
+    public func onFlagsUpdated(_ callback: @escaping ([String]) -> Void) -> JoryioSubscription {
         guard isInitialized, let flagsManager else {
             logger?.error("onFlagsUpdated() before initialize(): not registered")
-            return FlagsSubscription {}
+            return JoryioSubscription {}
         }
         return flagsManager.onFlagsUpdated(callback)
     }
