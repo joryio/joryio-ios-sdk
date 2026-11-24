@@ -717,6 +717,61 @@ final class PlacementManagerTests: XCTestCase {
         XCTAssertEqual(Set(sent), Set(names.suffix(20)), "the five tracked first were dropped")
     }
 
+    /// 1.4.0-beta.10 test (found on Android, RN shop app): /track/batch failing, m1..m25
+    /// tracked, flush, restore, flush. The deliveries waited behind the failing flush and then
+    /// SUCCEEDED - so they never went through the capped waiting list, and all 25 re-checks
+    /// ran. Only the 20 tracked last may run, each once, however the deliveries return.
+    func testDeliveriesQueuedBehindAFailingFlushThatSucceedLaterStillHonourTheCapOfTwenty() async {
+        let names = (1...25).map { "m\($0)" }
+        let t = recheckHero(names)
+        let events = names.map { ev($0) }
+        final class Gate: @unchecked Sendable {
+            private let lock = NSLock()
+            private var _open = false
+            private var _waiting = 0
+            var open: Bool { get { lock.lock(); defer { lock.unlock() }; return _open } set { lock.lock(); _open = newValue; lock.unlock() } }
+            var waiting: Int { lock.lock(); defer { lock.unlock() }; return _waiting }
+            func arrive() { lock.lock(); _waiting += 1; lock.unlock() }
+        }
+        let gate = Gate()
+        let m = PlacementManager(
+            transport: t,
+            load: { [unowned self] in self.stored },
+            save: { [unowned self] in self.stored = $0 },
+            consent: { [unowned self] in self.consentValue },
+            userId: { [unowned self] in self.user },
+            anonymousId: { "anon-1" },
+            sessionId: { [unowned self] in self.session },
+            capabilities: { ["placements", "content.native", "content.data"] },
+            now: { [unowned self] in self.clock },
+            onMain: { $0() },
+            screenClock: screenClock(),
+            // Each delivery waits behind the failing flush, then succeeds once it is restored.
+            deliverEvent: { _ in
+                gate.arrive()
+                while !gate.open { try? await Task.sleep(nanoseconds: 10_000_000) }
+                return true
+            },
+            isEventQueued: { [unowned self] id in self.stillQueued.contains(id) },
+            schedule: { [unowned self] delay, _ in self.scheduled.append(delay); return {} }
+        )
+        _ = await m.getPlacements(["home_hero"])
+        for e in events { stillQueued.insert(e.eventId) }
+        for (n, e) in zip(names, events) { m.onEventTracked(n, properties: [:], event: e) }
+        for _ in 0..<300 where gate.waiting < names.count { await settle(0.01) }
+        XCTAssertEqual(gate.waiting, names.count)
+        XCTAssertEqual(m.pendingRecheckCount, 20)
+        XCTAssertEqual(t.fetches.count, 1, "nothing before the server has the events")
+        stillQueued = []
+        gate.open = true
+        m.onEventsFlushed()   // the restored flush also reports in
+        await settle(0.6)
+        let sent = t.fetches.dropFirst().compactMap { ($0["recheckEvent"] as? [String: Any])?["name"] as? String }
+        XCTAssertEqual(sent.count, 20, "20 re-checks, not 25")
+        XCTAssertEqual(sent.sorted(), Array(names.suffix(20)).sorted(), "m6..m25, each once")
+        XCTAssertEqual(m.pendingRecheckCount, 0)
+    }
+
     func testAControlAnswerReportsControlViewedOnlyAfterItsMoment() async {
         let screen = screenClock()
         let t = FakeTransport { _ in self.answer("\"home_hero\":{\"placementKey\":\"home_hero\",\"isControl\":true,\"controlToken\":\"ctl-1\",\"items\":[],\"showWhen\":{\"kind\":\"seconds\",\"seconds\":5}}") }

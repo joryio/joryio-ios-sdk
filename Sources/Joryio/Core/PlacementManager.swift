@@ -183,7 +183,11 @@ final class PlacementManager: PlacementReporter {
     /// Event names tracked in the visit `sessionEventsId`.
     private var sessionEvents = Set<String>()
     private var sessionEventsId: String?
-    /// Re-checks whose event is still queued (a failed flush): run once after a flush sent it.
+    /// Every re-check not run yet, registered when its event is tracked, in tracking order
+    /// (`seq`); the oldest dropped past `PENDING_RECHECK_MAX`. A re-check runs only if it is
+    /// still here when its event is delivered - whether the delivery returns at once, returns
+    /// later (queued behind a failing flush), or a later flush sends it - and leaves it as it
+    /// runs, so it runs once. The cap holds by construction (1.4.0-beta.11).
     private var pendingRechecks: [Recheck] = []
     /// Answers apply in request order: an older request answering last never overwrites a newer one.
     private var requestSeq = 0
@@ -391,16 +395,8 @@ final class PlacementManager: PlacementReporter {
         if !recheck.isEmpty {
             let rc = Recheck(keys: recheck, eventId: event?.eventId, event: event.flatMap(Self.recheckEventJson),
                              subject: subjectKey(), consent: consent(), generation: locked { generation }, queuedAt: now(), seq: seq)
-            Task { [weak self] in await self?.startRecheck(rc) }
-        }
-    }
-
-    /// The server must have the event before it answers again.
-    private func startRecheck(_ rc: Recheck) async {
-        if let id = rc.eventId, !(await deliverEvent(id)) {
-            // Still queued (the flush failed): once, after the next flush that sends it.
-            // Kept in tracking order (each Task's delivery returns in its own time), so
-            // the one dropped past the cap is the OLDEST tracked.
+            // Registered now, at track time, in tracking order: past the cap the OLDEST
+            // tracked is dropped, however each delivery later returns.
             locked {
                 if let at = pendingRechecks.firstIndex(where: { $0.seq > rc.seq }) {
                     pendingRechecks.insert(rc, at: at)
@@ -409,9 +405,23 @@ final class PlacementManager: PlacementReporter {
                 }
                 if pendingRechecks.count > Self.PENDING_RECHECK_MAX { pendingRechecks.removeFirst(pendingRechecks.count - Self.PENDING_RECHECK_MAX) }
             }
-            return
+            Task { [weak self] in await self?.startRecheck(rc) }
         }
-        await runRecheck(rc)
+    }
+
+    /// The server must have the event before it answers again.
+    private func startRecheck(_ rc: Recheck) async {
+        // Still queued (the flush failed): it stays registered, and runs once, after the
+        // next flush that sends it - if it has not been dropped by then.
+        if let id = rc.eventId, !(await deliverEvent(id)) { return }
+        // Delivered (at once, or after waiting behind a failing flush): it runs only if it
+        // is still registered - not dropped past the cap, not already run.
+        let taken: Bool = locked {
+            guard let i = pendingRechecks.firstIndex(where: { $0.id == rc.id }) else { return false }
+            pendingRechecks.remove(at: i)
+            return true
+        }
+        if taken { await runRecheck(rc) }
     }
 
     /// The event queue finished a flush: re-checks whose event has left it run now, once.
@@ -424,8 +434,13 @@ final class PlacementManager: PlacementReporter {
         let due = waiting.filter { rc in rc.eventId.map { !isEventQueued($0) } ?? true }
         guard !due.isEmpty else { return }
         let ids = Set(due.map(\.id))
-        locked { pendingRechecks.removeAll { ids.contains($0.id) } }
-        for rc in due { Task { [weak self] in await self?.runRecheck(rc) } }
+        // Only those still registered: a delivery that returned meanwhile has run its own.
+        let taken: [Recheck] = locked {
+            let t = pendingRechecks.filter { ids.contains($0.id) }
+            pendingRechecks.removeAll { ids.contains($0.id) }
+            return t
+        }
+        for rc in taken { Task { [weak self] in await self?.runRecheck(rc) } }
     }
 
     /// Re-checks waiting for their event (test seam).
