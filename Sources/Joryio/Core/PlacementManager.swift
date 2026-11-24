@@ -200,7 +200,10 @@ final class PlacementManager: PlacementReporter {
         let consent: String?
         let generation: Int
         let queuedAt: TimeInterval
+        /// Tracking order, stamped when the event is tracked: "oldest" past the cap means tracked first.
+        let seq: Int
     }
+    private var recheckSeq = 0
 
     /// Pending re-checks kept at most (oldest dropped) and for at most this many seconds.
     static let PENDING_RECHECK_MAX = 20
@@ -355,6 +358,7 @@ final class PlacementManager: PlacementReporter {
     func onEventTracked(_ eventName: String, properties: [String: Any], event: Event? = nil) {
         var changed: [String] = []
         var recheck: [String] = []
+        var seq = 0
         locked {
             for (key, entry) in cache {
                 for item in entry.placement.items where item.triggers.contains(where: {
@@ -377,12 +381,16 @@ final class PlacementManager: PlacementReporter {
             visitEventsLocked()
             sessionEvents.insert(eventName)
             for key in updateMomentsLocked() where !changed.contains(key) { changed.append(key) }
+            if !recheck.isEmpty {
+                recheckSeq += 1
+                seq = recheckSeq
+            }
         }
         if !changed.isEmpty { applyChanged(changed) }
         reportDueDeferredControls()
         if !recheck.isEmpty {
             let rc = Recheck(keys: recheck, eventId: event?.eventId, event: event.flatMap(Self.recheckEventJson),
-                             subject: subjectKey(), consent: consent(), generation: locked { generation }, queuedAt: now())
+                             subject: subjectKey(), consent: consent(), generation: locked { generation }, queuedAt: now(), seq: seq)
             Task { [weak self] in await self?.startRecheck(rc) }
         }
     }
@@ -391,8 +399,14 @@ final class PlacementManager: PlacementReporter {
     private func startRecheck(_ rc: Recheck) async {
         if let id = rc.eventId, !(await deliverEvent(id)) {
             // Still queued (the flush failed): once, after the next flush that sends it.
+            // Kept in tracking order (each Task's delivery returns in its own time), so
+            // the one dropped past the cap is the OLDEST tracked.
             locked {
-                pendingRechecks.append(rc)
+                if let at = pendingRechecks.firstIndex(where: { $0.seq > rc.seq }) {
+                    pendingRechecks.insert(rc, at: at)
+                } else {
+                    pendingRechecks.append(rc)
+                }
                 if pendingRechecks.count > Self.PENDING_RECHECK_MAX { pendingRechecks.removeFirst(pendingRechecks.count - Self.PENDING_RECHECK_MAX) }
             }
             return

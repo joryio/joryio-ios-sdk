@@ -677,6 +677,46 @@ final class PlacementManagerTests: XCTestCase {
         XCTAssertEqual(Set(names2), Set(names.suffix(20)), "the oldest five were dropped")
     }
 
+    /// 1.4.0-beta.9 test (found on Android): each re-check's failed delivery returns in its
+    /// own time; the waiting list must still drop the five TRACKED first, not the five that
+    /// failed last. Here the oldest deliveries fail last.
+    func testPendingReChecksPastTwentyDropTheOldestTrackedEvenWhenFailuresReturnOutOfOrder() async {
+        let names = (0..<25).map { "e\($0)" }
+        let t = recheckHero(names)
+        let events = names.map { ev($0) }
+        let order = Dictionary(uniqueKeysWithValues: events.enumerated().map { ($1.eventId, $0) })
+        let m = PlacementManager(
+            transport: t,
+            load: { [unowned self] in self.stored },
+            save: { [unowned self] in self.stored = $0 },
+            consent: { [unowned self] in self.consentValue },
+            userId: { [unowned self] in self.user },
+            anonymousId: { "anon-1" },
+            sessionId: { [unowned self] in self.session },
+            capabilities: { ["placements", "content.native", "content.data"] },
+            now: { [unowned self] in self.clock },
+            onMain: { $0() },
+            screenClock: screenClock(),
+            // e0 fails last, e24 first.
+            deliverEvent: { id in
+                try? await Task.sleep(nanoseconds: UInt64(20_000_000 * (25 - (order[id] ?? 0))))
+                return false
+            },
+            isEventQueued: { [unowned self] id in self.stillQueued.contains(id) },
+            schedule: { [unowned self] delay, _ in self.scheduled.append(delay); return {} }
+        )
+        _ = await m.getPlacements(["home_hero"])
+        for e in events { stillQueued.insert(e.eventId) }
+        for (n, e) in zip(names, events) { m.onEventTracked(n, properties: [:], event: e) }   // no pause
+        await settle(1.0)
+        XCTAssertEqual(m.pendingRecheckCount, 20)
+        stillQueued = []
+        m.onEventsFlushed()
+        await settle(0.5)
+        let sent = t.fetches.dropFirst().compactMap { ($0["recheckEvent"] as? [String: Any])?["name"] as? String }
+        XCTAssertEqual(Set(sent), Set(names.suffix(20)), "the five tracked first were dropped")
+    }
+
     func testAControlAnswerReportsControlViewedOnlyAfterItsMoment() async {
         let screen = screenClock()
         let t = FakeTransport { _ in self.answer("\"home_hero\":{\"placementKey\":\"home_hero\",\"isControl\":true,\"controlToken\":\"ctl-1\",\"items\":[],\"showWhen\":{\"kind\":\"seconds\",\"seconds\":5}}") }
