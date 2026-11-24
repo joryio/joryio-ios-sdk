@@ -32,6 +32,10 @@ final class ScreenClock {
     private var accumulated: TimeInterval = 0
     private var visibleSince: Date?
     private var fired = Set<String>()
+    private var observers: [(Change) -> Void] = []
+
+    /// What moved the clock - for the placements' "Show when" (PlacementManager).
+    enum Change { case screen, paused, resumed }
 
     init(now: @escaping () -> Date = Date.init, visible: Bool = true) {
         self.now = now
@@ -59,7 +63,7 @@ final class ScreenClock {
     func enter(_ screenName: String) -> Bool {
         let next = screenName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !next.isEmpty else { return false }
-        return locked {
+        let changed: Bool = locked {
             if let current = _name, current.lowercased() == next.lowercased() { return false }
             _name = next
             accumulated = 0
@@ -67,17 +71,37 @@ final class ScreenClock {
             fired.removeAll()
             return true
         }
+        if changed { notify(.screen) }
+        return changed
     }
 
     func pause() {
-        locked {
-            if let since = visibleSince { accumulated += now().timeIntervalSince(since) }
+        let was: Bool = locked {
+            guard let since = visibleSince else { return false }
+            accumulated += now().timeIntervalSince(since)
             visibleSince = nil
+            return true
         }
+        if was { notify(.paused) }
     }
 
     func resume() {
-        locked { if visibleSince == nil { visibleSince = now() } }
+        let started: Bool = locked {
+            guard visibleSince == nil else { return false }
+            visibleSince = now()
+            return true
+        }
+        if started { notify(.resumed) }
+    }
+
+    /// Called after every new screen, pause and resume (outside the clock's lock).
+    func observe(_ observer: @escaping (Change) -> Void) {
+        locked { observers.append(observer) }
+    }
+
+    private func notify(_ change: Change) {
+        let all = locked { observers }
+        all.forEach { $0(change) }
     }
 
     func hasFired(_ campaignId: String) -> Bool { locked { fired.contains(campaignId) } }

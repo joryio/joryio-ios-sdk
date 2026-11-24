@@ -692,6 +692,26 @@ class StorageManager {
         }
     }
 
+    /// Is this event (its client `eventId`) still in the queue - not sent yet?
+    /// An error answers true: a "Show when" re-check then waits for the next flush
+    /// instead of reaching the server before its event.
+    func hasQueuedEvent(eventId: String) -> Bool {
+        guard let encodedId = try? JSONEncoder().encode([eventId]),
+              var fragment = String(data: encodedId, encoding: .utf8) else { return true }
+        fragment = String(fragment.dropFirst().dropLast())
+        let escaped = ("\"eventId\":" + fragment)
+            .replacingOccurrences(of: "!", with: "!!")
+            .replacingOccurrences(of: "%", with: "!%")
+            .replacingOccurrences(of: "_", with: "!_")
+        return dbQueue.sync {
+            guard let db = openDatabaseLocked() else { return true }
+            let events = Table("events")
+            let eventData = Expression<String>("event_data")
+            let count = (try? db.scalar(events.filter(eventData.like("%\(escaped)%", escape: "!")).count)) ?? 1
+            return count > 0
+        }
+    }
+
     func getDeviceToken() -> String? {
         return keychain.getString(forKey: kcDeviceTokenAccount)
     }

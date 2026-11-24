@@ -745,7 +745,12 @@ public class Joryio {
                 placementHtml
                     ? ["placements", "content.native", "content.data", "content.html"]
                     : ["placements", "content.native", "content.data"]
-            }
+            },
+            // "Show when" (D465): `seconds` counts on the time_on_screen clock;
+            // an event re-check goes only after its event has left the queue.
+            screenClock: inAppMessaging.screenClock,
+            deliverEvent: { [weak self] id in await self?.queue?.deliver(eventId: id) ?? false },
+            isEventQueued: { [weak self] id in self?.queue?.isQueued(eventId: id) ?? true }
         )
         self.cardManager = CardManager(
             transport: network,
@@ -813,7 +818,11 @@ public class Joryio {
 
         // One gate, asked by every outbound path (SDK contracts 4 and 5).
         queue.canSend = { [weak self] in self?.canSend ?? false }
-        queue.afterFlush = { [weak self] in self?.pruneRetiredTokens() }
+        queue.afterFlush = { [weak self] in
+            self?.pruneRetiredTokens()
+            // "Show when" re-checks whose event a failed flush had kept (D465).
+            self?.placementManager?.onEventsFlushed()
+        }
         queue.currentUserId = { [weak self] in self?.identity.getUserId() }
         // For SDK authentication the "current" user is the one a withdrawal is
         // sent for (SDK contract v6, 63): a user kept while tracking is off
@@ -1142,7 +1151,7 @@ public class Joryio {
         // the event is queued: the event is data and must be recorded whether
         // or not it triggers a message.
         inAppMessaging?.onEventTracked(eventName, properties: properties)
-        placementManager?.onEventTracked(eventName, properties: properties)
+        placementManager?.onEventTracked(eventName, properties: properties, event: event)
         // A screen view also moves the time_on_screen clock (ScreenClock.swift) -
         // from the event, so a queued trackScreen replayed after initialize()
         // and a hand-written track("Screen Viewed") count too.

@@ -177,7 +177,9 @@ public final class PlacementView: UIView, PlacementHost {
             c.priority = .defaultHigh
             c.isActive = true
             heightConstraint = c
-            if placement.isControl { viewability.add(self) { placement.markDisplayed() } }
+            // A held-out spot reports control_viewed; on any empty spot it also tells
+            // the SDK the spot was viewable (a deferred control of a Show when campaign).
+            viewability.add(self) { placement.markDisplayed() }
         }
         accessibilityElementsHidden = drawn.isEmpty
         invalidateIntrinsicContentSize()

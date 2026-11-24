@@ -83,6 +83,8 @@ class QueueManager {
     private var flushTimer: Timer?
     private let flushLock = NSLock()
     private var isFlushingQueue = false
+    /// Waiting for the flush in flight to end (flushAfterInFlight).
+    private var flushWaiters: [CheckedContinuation<Void, Never>] = []
 
     // Backoff + suspension state, under `flushLock`.
     private var consecutiveFailures = 0
@@ -184,8 +186,13 @@ class QueueManager {
         }
 
         defer {
-            withFlushLock { isFlushingQueue = false }
+            let waiters: [CheckedContinuation<Void, Never>] = withFlushLock {
+                isFlushingQueue = false
+                defer { flushWaiters.removeAll() }
+                return flushWaiters
+            }
             afterFlush()
+            waiters.forEach { $0.resume() }
         }
 
         guard canSend() else {
@@ -377,6 +384,36 @@ class QueueManager {
 
     /// False only in tests, which run without a UIApplication.
     var usesBackgroundTask = true
+
+    /// Wait for a flush in flight (if any) to end, then flush - so an event
+    /// queued while that flush was already reading the queue is sent too.
+    func flushAfterInFlight() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            let waiting: Bool = withFlushLock {
+                guard isFlushingQueue else { return false }
+                flushWaiters.append(cont)
+                return true
+            }
+            if !waiting { cont.resume() }
+        }
+        await flush()
+    }
+
+    /**
+     A "Show when" re-check (D465) must not reach the server before its event:
+     true once the event (its client `eventId`) has left the queue - sent by
+     the flush in flight or by one more. False when it is still queued (a
+     failure, a backoff, no consent): the caller waits for the next flush.
+     */
+    func deliver(eventId: String) async -> Bool {
+        for _ in 0..<3 {
+            if !isQueued(eventId: eventId) { return true }
+            await flushAfterInFlight()
+        }
+        return !isQueued(eventId: eventId)
+    }
+
+    func isQueued(eventId: String) -> Bool { storage.hasQueuedEvent(eventId: eventId) }
 
     func flushSync(force: Bool = false) {
         guard usesBackgroundTask else {

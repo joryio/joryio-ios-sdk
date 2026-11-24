@@ -36,6 +36,47 @@ public enum Placements {
     /// `emptyBehavior` wire values.
     public static let collapse = "collapse"
     public static let keepSpace = "keep_space"
+    /// "Show when" (BACKLOG D465): the moment a placement campaign's content is
+    /// revealed on a screen - the `kind` values the wire may carry. An app
+    /// honours `load`, `seconds` (foreground seconds on the screen) and `event`
+    /// (tracked in this visit); `scroll` and `exit` are web-only and, like an
+    /// unknown kind, are never shown.
+    public static let SHOW_WHEN_KINDS: [String] = ["load", "seconds", "scroll", "exit", "event"]
+}
+
+/**
+ A served "Show when" (BACKLOG D465) as an app honours it. Wire contract:
+ packages/backend/src/common/show-when.ts - `{ kind: 'load' }` (also: no
+ field), `{ kind: 'seconds', seconds: 1..3600 }`, `{ kind: 'event', event }`;
+ `scroll` / `exit` (web only), an unknown kind or an invalid value become
+ `never`: such content is not shown at all (never treated as `load`).
+ */
+enum ShowWhenMoment: Equatable {
+    case load
+    /// Foreground seconds on the current screen (the time_on_screen clock).
+    case seconds(Double)
+    /// The event was tracked in this visit (the SDK session).
+    case event(String)
+    case never
+
+    static func parse(_ raw: Any?) -> ShowWhenMoment {
+        if raw == nil || raw is NSNull { return .load }
+        guard let o = raw as? [String: Any] else { return .never }
+        switch o["kind"] as? String {
+        case "load":
+            return .load
+        case "seconds":
+            guard let n = o["seconds"] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return .never }
+            let d = n.doubleValue
+            return d == d.rounded() && d >= 1 && d <= 3600 ? .seconds(d) : .never
+        case "event":
+            let e = ((o["event"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return !e.isEmpty && e.utf16.count <= 255 ? .event(e) : .never
+        default:
+            // scroll / exit need a page; anything else is unknown.
+            return .never
+        }
+    }
 }
 
 /// A button of a native item.

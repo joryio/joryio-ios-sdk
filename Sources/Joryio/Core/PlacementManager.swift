@@ -16,6 +16,8 @@ final class PlacementItemWire {
     let triggers: [[String: Any]]
     let triggerWindowSeconds: Int?
     let expiresAt: String?
+    /// "Show when" (D465): the moment it is revealed on a screen; absent = load.
+    let showWhen: ShowWhenMoment
 
     init?(_ o: [String: Any]) {
         guard let id = o["id"] as? String else { return nil }
@@ -46,6 +48,7 @@ final class PlacementItemWire {
         triggers = (o["triggers"] as? [[String: Any]]) ?? []
         triggerWindowSeconds = (o["placementTriggerWindowSeconds"] as? NSNumber)?.intValue
         expiresAt = o["expiresAt"] as? String
+        showWhen = ShowWhenMoment.parse(o["showWhen"])
     }
 }
 
@@ -58,6 +61,14 @@ final class PlacementWire {
     let isControl: Bool
     let controlToken: String?
     let items: [PlacementItemWire]
+    /// A control answer's "Show when" (D465): the moment the held-out treatment
+    /// would have been revealed - `control_viewed` waits for it.
+    let showWhen: ShowWhenMoment
+    /// Control exposures of A/B-control campaigns that fell through to the drawn
+    /// item at a different moment: each reported once at ITS moment, once the spot was viewable.
+    let deferredControls: [(controlToken: String, showWhen: ShowWhenMoment)]
+    /// Event names that, when tracked, make the SDK re-fetch this key at once.
+    let recheckOn: [String]
     /// The JSON as received: the disk cache and change detection.
     let json: [String: Any]
 
@@ -71,6 +82,12 @@ final class PlacementWire {
         isControl = (o["isControl"] as? Bool) ?? false
         controlToken = o["controlToken"] as? String
         items = ((o["items"] as? [[String: Any]]) ?? []).compactMap { PlacementItemWire($0) }
+        showWhen = isControl ? ShowWhenMoment.parse(o["showWhen"]) : .load
+        deferredControls = ((o["deferredControls"] as? [[String: Any]]) ?? []).compactMap { d in
+            guard let token = d["controlToken"] as? String, !token.isEmpty else { return nil }
+            return (token, ShowWhenMoment.parse(d["showWhen"]))
+        }
+        recheckOn = ((o["recheckOn"] as? [Any]) ?? []).compactMap { $0 as? String }.filter { !$0.isEmpty }
         json = o
     }
 }
@@ -96,7 +113,20 @@ protocol PlacementTransport: AnyObject {
    forced refresh inside that window is deferred and coalesced; a 429 or a
    failure keeps the cache;
  - an identity or consent change bumps a generation: older answers are dropped;
- - without consent the request names nobody and nothing is reported.
+ - without consent the request names nobody and nothing is reported;
+ - "Show when" (BACKLOG D465, packages/backend/src/common/show-when.ts): an
+   item, a control answer and each deferred control carry the moment they are
+   revealed on a screen. The content is fetched as before and HELD - left out
+   of every Placement - until its moment: `seconds` = foreground seconds on
+   the current screen (the time_on_screen ScreenClock), `event` = the event
+   was tracked in this visit (SDK session). `scroll` / `exit` / unknown are
+   never shown. Revealed content stays for the screen; a new screen starts the
+   moment again. An event that something waits on (or that the answer lists in
+   `recheckOn`) re-checks the key at once, past PLACEMENT_MIN_REFRESH_SECONDS,
+   at most once per (key, event) per screen: only after the event has left the
+   queue (sent by the flush in flight or one more; after a failure, once after
+   the next successful flush), in a request of its own that carries the event
+   as `recheckEvent: { name, eventId, properties }`.
  */
 final class PlacementManager: PlacementReporter {
     private struct Entry {
@@ -131,6 +161,52 @@ final class PlacementManager: PlacementReporter {
     private var dismissedLocally = Set<String>()
     private var generation = 0
 
+    // "Show when" (D465)
+    private enum MomentKind { case item, control, deferred }
+    private struct MomentId: Hashable {
+        let kind: MomentKind
+        let key: String
+        let token: String
+    }
+    private let screenClock: ScreenClock
+    /// Sends the queue until this event (client eventId) has left it; false = still queued.
+    private let deliverEvent: (String) async -> Bool
+    /// Is this event still queued? (a pending re-check runs once it is not)
+    private let isEventQueued: (String) -> Bool
+    private let schedule: (TimeInterval, @escaping () -> Void) -> () -> Void
+    /// Moments reached on the current screen (cleared by a new screen).
+    private var revealed = Set<MomentId>()
+    /// Keys whose spot was viewable on the current screen (deferred controls wait for it).
+    private var viewedOnScreen = Set<String>()
+    /// `key\0event` re-checked on the current screen.
+    private var rechecked = Set<String>()
+    /// Event names tracked in the visit `sessionEventsId`.
+    private var sessionEvents = Set<String>()
+    private var sessionEventsId: String?
+    /// Re-checks whose event is still queued (a failed flush): run once after a flush sent it.
+    private var pendingRechecks: [Recheck] = []
+    /// Answers apply in request order: an older request answering last never overwrites a newer one.
+    private var requestSeq = 0
+    private var appliedSeq: [String: Int] = [:]
+
+    private struct Recheck {
+        let id = UUID()
+        let keys: [String]
+        let eventId: String?
+        /// `{ name, eventId, properties }`, the event as queued; nil without the event.
+        let event: [String: Any]?
+        /// Who and under which consent it was queued for: it never runs for anyone else.
+        let subject: String
+        let consent: String?
+        let generation: Int
+        let queuedAt: TimeInterval
+    }
+
+    /// Pending re-checks kept at most (oldest dropped) and for at most this many seconds.
+    static let PENDING_RECHECK_MAX = 20
+    static let PENDING_RECHECK_MAX_AGE_SECONDS: TimeInterval = 60
+    private var cancelMomentTimer: (() -> Void)?
+
     private struct WeakHost { weak var host: PlacementHost? }
 
     init(
@@ -143,7 +219,15 @@ final class PlacementManager: PlacementReporter {
         sessionId: @escaping () -> String?,
         capabilities: @escaping () -> [String],
         now: @escaping () -> TimeInterval = { Date().timeIntervalSince1970 },
-        onMain: @escaping (@escaping () -> Void) -> Void = { block in DispatchQueue.main.async(execute: block) }
+        onMain: @escaping (@escaping () -> Void) -> Void = { block in DispatchQueue.main.async(execute: block) },
+        screenClock: ScreenClock = ScreenClock(),
+        deliverEvent: @escaping (String) async -> Bool = { _ in true },
+        isEventQueued: @escaping (String) -> Bool = { _ in false },
+        schedule: @escaping (TimeInterval, @escaping () -> Void) -> () -> Void = { delay, block in
+            let work = DispatchWorkItem(block: block)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+            return { work.cancel() }
+        }
     ) {
         self.transport = transport
         self.load = load
@@ -155,7 +239,20 @@ final class PlacementManager: PlacementReporter {
         self.capabilities = capabilities
         self.now = now
         self.onMain = onMain
+        self.screenClock = screenClock
+        self.deliverEvent = deliverEvent
+        self.isEventQueued = isEventQueued
+        self.schedule = schedule
         loadCache()
+        locked { _ = updateMomentsLocked() }
+        screenClock.observe { [weak self] change in
+            switch change {
+            case .screen: self?.screenChanged()
+            case .paused: self?.stopMomentTimer()
+            case .resumed: self?.scheduleMomentTimer()
+            }
+        }
+        scheduleMomentTimer()
     }
 
     private func locked<T>(_ body: () -> T) -> T {
@@ -239,6 +336,10 @@ final class PlacementManager: PlacementReporter {
             triggeredAt.removeAll()
             dismissedLocally.removeAll()
             reported.removeAll()
+            revealed.removeAll()
+            viewedOnScreen.removeAll()
+            rechecked.removeAll()
+            pendingRechecks.removeAll()
             let live = liveHosts()
             return (Array(Set(live.map { $0.placementKey })), live)
         }
@@ -248,9 +349,12 @@ final class PlacementManager: PlacementReporter {
         if !keys.isEmpty { fetchKeys(keys, force: true) {} }
     }
 
-    /// An event was tracked: event-triggered items waiting on it become eligible (no round trip).
-    func onEventTracked(_ eventName: String, properties: [String: Any]) {
+    /// An event was tracked: event-triggered items waiting on it become eligible (no round trip);
+    /// "Show when" `event` moments are reached, and the keys waiting on it are re-checked.
+    /// `event`: the event as queued - its eventId gates the re-check and rides on it.
+    func onEventTracked(_ eventName: String, properties: [String: Any], event: Event? = nil) {
         var changed: [String] = []
+        var recheck: [String] = []
         locked {
             for (key, entry) in cache {
                 for item in entry.placement.items where item.triggers.contains(where: {
@@ -260,8 +364,81 @@ final class PlacementManager: PlacementReporter {
                     if !changed.contains(key) { changed.append(key) }
                 }
             }
+            // Show when: the keys that wait on this event, BEFORE it counts.
+            let moment = ShowWhenMoment.event(eventName)
+            for (key, entry) in cache {
+                let p = entry.placement
+                let waits = p.recheckOn.contains(eventName)
+                    || p.items.contains { $0.showWhen == moment && !revealed.contains(itemMoment(key, $0)) }
+                    || (p.isControl && p.showWhen == moment && !revealed.contains(controlMoment(key, p)))
+                    || p.deferredControls.contains { $0.showWhen == moment && !revealed.contains(MomentId(kind: .deferred, key: key, token: $0.controlToken)) }
+                if waits && rechecked.insert("\(key)\u{0}\(eventName)").inserted { recheck.append(key) }
+            }
+            visitEventsLocked()
+            sessionEvents.insert(eventName)
+            for key in updateMomentsLocked() where !changed.contains(key) { changed.append(key) }
         }
         if !changed.isEmpty { applyChanged(changed) }
+        reportDueDeferredControls()
+        if !recheck.isEmpty {
+            let rc = Recheck(keys: recheck, eventId: event?.eventId, event: event.flatMap(Self.recheckEventJson),
+                             subject: subjectKey(), consent: consent(), generation: locked { generation }, queuedAt: now())
+            Task { [weak self] in await self?.startRecheck(rc) }
+        }
+    }
+
+    /// The server must have the event before it answers again.
+    private func startRecheck(_ rc: Recheck) async {
+        if let id = rc.eventId, !(await deliverEvent(id)) {
+            // Still queued (the flush failed): once, after the next flush that sends it.
+            locked {
+                pendingRechecks.append(rc)
+                if pendingRechecks.count > Self.PENDING_RECHECK_MAX { pendingRechecks.removeFirst(pendingRechecks.count - Self.PENDING_RECHECK_MAX) }
+            }
+            return
+        }
+        await runRecheck(rc)
+    }
+
+    /// The event queue finished a flush: re-checks whose event has left it run now, once.
+    func onEventsFlushed() {
+        // Too old, or queued for someone else / another consent: dropped, never run.
+        let waiting: [Recheck] = locked {
+            pendingRechecks.removeAll { !stillValidLocked($0) }
+            return pendingRechecks
+        }
+        let due = waiting.filter { rc in rc.eventId.map { !isEventQueued($0) } ?? true }
+        guard !due.isEmpty else { return }
+        let ids = Set(due.map(\.id))
+        locked { pendingRechecks.removeAll { ids.contains($0.id) } }
+        for rc in due { Task { [weak self] in await self?.runRecheck(rc) } }
+    }
+
+    /// Re-checks waiting for their event (test seam).
+    var pendingRecheckCount: Int { locked { pendingRechecks.count } }
+
+    /// Lock held. The same person, consent and generation, and not older than the limit.
+    private func stillValidLocked(_ rc: Recheck) -> Bool {
+        rc.generation == generation && now() - rc.queuedAt <= Self.PENDING_RECHECK_MAX_AGE_SECONDS
+            && rc.subject == subjectKey() && rc.consent == consent()
+    }
+
+    /// A request of its own (never batched with other keys), past the refresh limit.
+    private func runRecheck(_ rc: Recheck) async {
+        guard locked({ stillValidLocked(rc) }) else { return }
+        var start = 0
+        while start < rc.keys.count {
+            let chunk = Array(rc.keys[start..<min(rc.keys.count, start + Placements.PLACEMENT_MAX_KEYS_PER_REQUEST)])
+            await request(chunk, recheckEvent: rc.event)
+            start += Placements.PLACEMENT_MAX_KEYS_PER_REQUEST
+        }
+    }
+
+    /// `{ name, eventId, properties }` from the event as the queue encodes it.
+    static func recheckEventJson(_ event: Event) -> [String: Any]? {
+        guard let data = try? WireJSON.encoder().encode(event),
+              let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        return ["name": event.type, "eventId": event.eventId, "properties": o["properties"] ?? [String: Any]()]
     }
 
     // MARK: - Fetching
@@ -375,10 +552,11 @@ final class PlacementManager: PlacementReporter {
         callbacks.forEach { $0() }
     }
 
-    private func request(_ keys: [String]) async {
+    private func request(_ keys: [String], recheckEvent: [String: Any]? = nil) async {
         guard let consentNow = consent() else { return }
         let personal = consentNow == "granted"
-        let (generationAtStart, shown): (Int, [String: [String]]) = locked {
+        let (generationAtStart, seq, shown): (Int, Int, [String: [String]]) = locked {
+            requestSeq += 1
             let t = now()
             for key in keys { lastNetworkAt[key] = t }
             var shown: [String: [String]] = [:]
@@ -386,7 +564,7 @@ final class PlacementManager: PlacementReporter {
                 let ids = host.shownIds()
                 if !ids.isEmpty { shown[host.placementKey] = ids }
             }
-            return (generation, shown)
+            return (generation, requestSeq, shown)
         }
         var body: [String: Any] = [
             "deviceType": "ios",
@@ -402,6 +580,8 @@ final class PlacementManager: PlacementReporter {
             body["anonymousId"] = anonymousId()
             if let session = sessionId() { body["sessionId"] = session }
         }
+        // A Show when re-check: the event that triggered it, counted by the server as arriving now.
+        if let recheckEvent, JSONSerialization.isValidJSONObject(recheckEvent) { body["recheckEvent"] = recheckEvent }
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
         let (status, answer) = await transport.fetchPlacements(data)
         guard (200...299).contains(status), let answer,
@@ -413,6 +593,9 @@ final class PlacementManager: PlacementReporter {
             guard generation == generationAtStart else { return false }
             let fetchedAt = now()
             for key in keys {
+                // An answer to an older request that arrived after a newer one: not applied.
+                if let applied = appliedSeq[key], applied > seq { continue }
+                appliedSeq[key] = seq
                 // A key the server left out is an empty placement, never an error.
                 let json = (placements[key] as? [String: Any]) ?? ["placementKey": key, "items": []]
                 let wire = PlacementWire(key: key, json)
@@ -421,11 +604,15 @@ final class PlacementManager: PlacementReporter {
                 dismissedLocally = dismissedLocally.filter { !$0.hasPrefix("\(key)\u{0}") }
                 if before == nil || !NSDictionary(dictionary: before!.placement.json).isEqual(to: json) { changed.append(key) }
             }
+            // A moment already reached (an event earlier in the visit, seconds already spent) shows at once.
+            for key in updateMomentsLocked() where !changed.contains(key) { changed.append(key) }
             return true
         }
         guard applied else { return }
         persistCache()
         if !changed.isEmpty { applyChanged(changed) }
+        reportDueDeferredControls()
+        scheduleMomentTimer()
     }
 
     private func applyChanged(_ keys: [String]) {
@@ -452,6 +639,8 @@ final class PlacementManager: PlacementReporter {
             let items = entry.placement.items.filter { item in
                 if let expires = item.expiresAt.flatMap(Self.parseIso), expires <= t { return false }
                 if dismissedLocally.contains(handle(key, item)) { return false }
+                // Show when: held until its moment on this screen.
+                if !itemOpenLocked(key, item) { return false }
                 if item.triggers.contains(where: { ($0["type"] as? String) == "event" }) {
                     guard let at = triggeredAt[handle(key, item)] else { return false }
                     let window = TimeInterval(item.triggerWindowSeconds ?? Placements.PLACEMENT_DEFAULT_TRIGGER_WINDOW_SECONDS)
@@ -480,6 +669,12 @@ final class PlacementManager: PlacementReporter {
         // Served for someone who is no longer here (identify / reset since): nothing.
         guard locked({ generation == self.generation }) else { return }
         guard consent() == "granted" else { return }
+        if type == "displayed" {
+            // An impression counts only when the content is shown: never while held (Show when).
+            guard locked({ itemOpenLocked(key, item) }) else { return }
+            _ = locked { viewedOnScreen.insert(key) }
+            reportDueDeferredControls()
+        }
         if type != "clicked" {
             let first = locked { reported.insert("\(type):\(handle(key, item))").inserted }
             if !first { return }
@@ -517,11 +712,25 @@ final class PlacementManager: PlacementReporter {
     }
 
     /// A held-out person's empty spot was viewable: `in_app.control_viewed`, once per control token.
+    /// With a Show when, not before the moment the treatment would have been revealed (ignored before it;
+    /// onPlacementsUpdated fires at the moment). On any placement it also counts as "the spot was viewable"
+    /// for the answer's deferred controls.
     func reportControl(_ generation: Int, _ key: String) {
         guard locked({ generation == self.generation }) else { return }
-        guard let token = locked({ cache[key]?.placement }).flatMap({ $0.isControl ? $0.controlToken : nil }) else { return }
+        _ = locked { viewedOnScreen.insert(key) }
+        reportDueDeferredControls()
+        let token: String? = locked {
+            guard let p = cache[key]?.placement, p.isControl, let token = p.controlToken, controlOpenLocked(key, p) else { return nil }
+            return token
+        }
+        guard let token else { return }
         guard consent() == "granted" else { return }
         guard locked({ reported.insert("control:\(token)").inserted }) else { return }
+        sendControlViewed(token, key)
+    }
+
+    /// The exact body of every `control_viewed` report.
+    private func sendControlViewed(_ token: String, _ key: String) {
         var body: [String: Any] = [
             "action": "control_viewed",
             "controlToken": token,
@@ -531,6 +740,143 @@ final class PlacementManager: PlacementReporter {
         ]
         subject(&body)
         send(body)
+    }
+
+    /// Deferred controls whose moment has come on a spot viewable on this screen: each once, with consent.
+    private func reportDueDeferredControls() {
+        guard consent() == "granted" else { return }
+        let due: [(String, String)] = locked {
+            var out: [(String, String)] = []
+            for key in viewedOnScreen {
+                guard let p = cache[key]?.placement else { continue }
+                for d in p.deferredControls where momentOpenLocked(d.showWhen, MomentId(kind: .deferred, key: key, token: d.controlToken)) {
+                    if reported.insert("control:\(d.controlToken)").inserted { out.append((d.controlToken, key)) }
+                }
+            }
+            return out
+        }
+        for (token, key) in due { sendControlViewed(token, key) }
+    }
+
+    // MARK: - Show when (D465)
+
+    private func itemMoment(_ key: String, _ item: PlacementItemWire) -> MomentId {
+        MomentId(kind: .item, key: key, token: item.deliveryToken ?? item.id)
+    }
+
+    private func controlMoment(_ key: String, _ p: PlacementWire) -> MomentId {
+        MomentId(kind: .control, key: key, token: p.controlToken ?? "")
+    }
+
+    /// Lock held. `load` always; otherwise once reached on this screen.
+    private func momentOpenLocked(_ moment: ShowWhenMoment, _ id: MomentId) -> Bool {
+        moment == .load || revealed.contains(id)
+    }
+
+    private func itemOpenLocked(_ key: String, _ item: PlacementItemWire) -> Bool {
+        momentOpenLocked(item.showWhen, itemMoment(key, item))
+    }
+
+    private func controlOpenLocked(_ key: String, _ p: PlacementWire) -> Bool {
+        momentOpenLocked(p.showWhen, controlMoment(key, p))
+    }
+
+    /// Lock held. The visit's event names, started over when the SDK session changed.
+    private func visitEventsLocked() {
+        let id = sessionId()
+        if id != sessionEventsId {
+            sessionEventsId = id
+            sessionEvents.removeAll()
+        }
+    }
+
+    /// Lock held. Has this moment come on the current screen?
+    private func reachedLocked(_ moment: ShowWhenMoment) -> Bool {
+        switch moment {
+        case .load: return true
+        case .seconds(let n): return screenClock.seconds + 0.001 >= n
+        case .event(let e):
+            visitEventsLocked()
+            return sessionEvents.contains(e)
+        case .never: return false
+        }
+    }
+
+    /// Lock held. Marks every moment reached now; returns the keys whose Placement changed
+    /// (an item revealed, a control answer's moment came).
+    @discardableResult
+    private func updateMomentsLocked() -> [String] {
+        var changed: [String] = []
+        for (key, entry) in cache {
+            let p = entry.placement
+            var ids: [(MomentId, ShowWhenMoment)] = p.items.filter { $0.showWhen != .load }.map { (itemMoment(key, $0), $0.showWhen) }
+            if p.isControl, p.showWhen != .load { ids.append((controlMoment(key, p), p.showWhen)) }
+            ids += p.deferredControls.filter { $0.showWhen != .load }.map { (MomentId(kind: .deferred, key: key, token: $0.controlToken), $0.showWhen) }
+            for (id, moment) in ids where !revealed.contains(id) && reachedLocked(moment) {
+                revealed.insert(id)
+                if id.kind != .deferred && !changed.contains(key) { changed.append(key) }
+            }
+        }
+        return changed
+    }
+
+    /// The seconds moments' timer fired (tests call it directly).
+    func checkShowWhen() {
+        let changed = locked { updateMomentsLocked() }
+        if !changed.isEmpty { applyChanged(changed) }
+        reportDueDeferredControls()
+        scheduleMomentTimer()
+    }
+
+    /// A new screen: every moment starts again (content revealed by a non-load moment is held
+    /// again until the new screen's moment; an event of this visit still counts at once).
+    private func screenChanged() {
+        let changed: [String] = locked {
+            let before = revealed
+            revealed.removeAll()
+            viewedOnScreen.removeAll()
+            rechecked.removeAll()
+            pendingRechecks.removeAll()
+            updateMomentsLocked()
+            var keys: [String] = []
+            for id in before.symmetricDifference(revealed) where id.kind != .deferred && !keys.contains(id.key) { keys.append(id.key) }
+            return keys
+        }
+        if !changed.isEmpty { applyChanged(changed) }
+        scheduleMomentTimer()
+    }
+
+    private func stopMomentTimer() {
+        let cancel: (() -> Void)? = locked {
+            defer { cancelMomentTimer = nil }
+            return cancelMomentTimer
+        }
+        cancel?()
+    }
+
+    /// One timer for the nearest `seconds` moment not reached yet (none while in the background).
+    private func scheduleMomentTimer() {
+        stopMomentTimer()
+        let wait: TimeInterval? = locked {
+            guard screenClock.isVisible else { return nil }
+            let elapsed = screenClock.seconds
+            var next: TimeInterval?
+            for (key, entry) in cache {
+                let p = entry.placement
+                var pending: [(MomentId, ShowWhenMoment)] = p.items.map { (itemMoment(key, $0), $0.showWhen) }
+                if p.isControl { pending.append((controlMoment(key, p), p.showWhen)) }
+                pending += p.deferredControls.map { (MomentId(kind: .deferred, key: key, token: $0.controlToken), $0.showWhen) }
+                for (id, moment) in pending where !revealed.contains(id) {
+                    guard case .seconds(let n) = moment else { continue }
+                    let w = max(0, n - elapsed)
+                    next = min(next ?? w, w)
+                }
+            }
+            return next
+        }
+        guard let wait else { return }
+        let cancel = schedule(wait + 0.05) { [weak self] in self?.checkShowWhen() }
+        locked { cancelMomentTimer = cancel }
     }
 
     private func subject(_ body: inout [String: Any]) {
