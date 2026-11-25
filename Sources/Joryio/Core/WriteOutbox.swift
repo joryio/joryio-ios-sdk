@@ -47,6 +47,17 @@ struct OutboxEntry: Codable, Equatable {
     /// group on a channel): a newer one replaces a queued older one, so an
     /// older retry can never land after it (contract v4, 37).
     var supersedeKey: String?
+    /// Failed sends this write had before it reached the outbox
+    /// (1.4.0-beta.14): 1 for a flag exposures batch whose own direct send
+    /// failed, so the backoff after its first outbox attempt continues from
+    /// there. Nil in an older outbox = 0.
+    var failures: Int?
+    /// Not sent before this moment (1.4.0-beta.14): set when the write was
+    /// handed over after its own direct send failed - the first backoff
+    /// step, or the server's Retry-After when longer. Only this entry waits
+    /// (the drain steps past it to the writes behind it), and it is stored
+    /// with the entry, so a relaunch waits it out too. Nil = no wait.
+    var firstAttemptNotBefore: Date?
 
     init(
         kind: Kind,
@@ -171,6 +182,8 @@ final class WriteOutbox {
     /// Test seams: seconds.
     var baseBackoff: TimeInterval = 2
     var notFoundDelay: TimeInterval = 1
+    /// Test seam: the clock a write's first wait is set and read against.
+    var now: () -> Date = Date.init
 
     private let lock = NSLock()
     private var entries: [OutboxEntry] = []
@@ -292,6 +305,37 @@ final class WriteOutbox {
         }
     }
 
+    /**
+     Queue a write whose own direct send just failed (no answer, 5xx, 408,
+     429 - a flag exposures batch, 1.4.0-beta.14). It counts as having failed
+     once: its first outbox attempt waits the first backoff step
+     (`baseBackoff` x 2), or `retryAfter` - the failed send's Retry-After -
+     when longer, capped at `maxBackoffSeconds`. The kick that follows an add
+     used to re-send it a few milliseconds after the failure. Only this entry
+     waits: the writes already queued go as before.
+     */
+    func addAfterFailedSend(_ entry: OutboxEntry, retryAfter: TimeInterval? = nil) {
+        var waiting = entry
+        waiting.failures = max(entry.failures ?? 0, 1)
+        waiting.firstAttemptNotBefore = now().addingTimeInterval(firstRetryDelay(retryAfter: retryAfter))
+        add(waiting)
+    }
+
+    /// The wait before a write that failed once is tried again: the first
+    /// backoff step, or a longer Retry-After.
+    func firstRetryDelay(retryAfter: TimeInterval? = nil) -> TimeInterval {
+        let server = min(max(retryAfter ?? 0, 0), Self.maxBackoffSeconds)
+        return min(max(baseBackoff * 2, server), Self.maxBackoffSeconds)
+    }
+
+    /// Is `entry` still waiting out its first wait? One further away than
+    /// `maxBackoffSeconds` means the clock moved: it goes now.
+    private func waitingFirstAttempt(_ entry: OutboxEntry, at now: Date) -> Bool {
+        guard let at = entry.firstAttemptNotBefore else { return false }
+        let left = at.timeIntervalSince(now)
+        return left > 0 && left <= Self.maxBackoffSeconds
+    }
+
     /// Over the cap: drop the oldest write that is not a withdrawal; a
     /// withdrawal only when the outbox holds nothing else. It used to drop
     /// the oldest whatever it was - an unsubscribe queued while offline
@@ -407,7 +451,12 @@ final class WriteOutbox {
             return now < until
         }
 
-        while let queued = withLock({ entries.first(where: { permits($0) && !(collectionParked && $0.isCollection) }) }) {
+        while let queued = withLock({ () -> OutboxEntry? in
+            let at = self.now()
+            return entries.first(where: {
+                permits($0) && !(collectionParked && $0.isCollection) && !waitingFirstAttempt($0, at: at)
+            })
+        }) {
             let entry = resolve(queued)
             let outcome = await sender(entry.path, Data(entry.body.utf8), entry.userId)
             switch outcome {
@@ -485,7 +534,16 @@ final class WriteOutbox {
             else { return nil }
             return until.timeIntervalSinceNow
         }
-        if let parkedWait { scheduleRetry(after: parkedWait) }
+        // A write stepped past because its first wait is not over: come back
+        // for it when it is (1.4.0-beta.14).
+        let firstAttemptWait: TimeInterval? = withLock {
+            let at = self.now()
+            return entries
+                .filter { permits($0) && waitingFirstAttempt($0, at: at) }
+                .compactMap { $0.firstAttemptNotBefore?.timeIntervalSince(at) }
+                .min()
+        }
+        if let wait = [parkedWait, firstAttemptWait].compactMap({ $0 }).min() { scheduleRetry(after: wait) }
     }
 
     /// Count the failure and schedule the retry. Returns false when the entry
@@ -505,7 +563,9 @@ final class WriteOutbox {
             return false
         }
         let wait: TimeInterval = withLock {
-            failures += 1
+            // A write handed over after its own failed send has failed
+            // before: the backoff goes on from there.
+            failures = max(failures, entry.failures ?? 0) + 1
             let backoff = min(baseBackoff * pow(2.0, Double(min(failures, 7))), Self.maxBackoffSeconds)
             nextAttemptAt = Date().addingTimeInterval(backoff)
             var serverWait: TimeInterval = 0

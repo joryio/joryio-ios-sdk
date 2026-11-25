@@ -118,8 +118,11 @@ final class FlagsManager {
         var saveExposures: (String?) -> Void = { _ in }
         /// Nil: `post`, a 200 when it answered and 0 when it did not.
         var postExposures: PostExposures?
-        /// Hand a batch the server did not take to the persisted write outbox (same body, same key).
-        var enqueueExposures: (String) -> Void = { _ in }
+        /// Hand a batch the server did not take to the persisted write outbox
+        /// (same body, same key), with that answer's Retry-After: its first
+        /// outbox attempt waits the first backoff step, or the Retry-After
+        /// when longer.
+        var enqueueExposures: (String, TimeInterval?) -> Void = { _, _ in }
         /// The bodies of the exposure batches waiting in the write outbox.
         var pendingExposures: () -> [String] = { [] }
     }
@@ -454,7 +457,9 @@ final class FlagsManager {
         // Not taken: the persisted outbox retries it, same body and key - unless
         // the data was wiped or sending stopped (opt-out, consent) meanwhile.
         if withLock({ batch.wipe == wipes }), deps.canSend(), let body = String(data: data, encoding: .utf8) {
-            deps.enqueueExposures(body)
+            // Its first outbox attempt waits (it failed once, and the server
+            // may have said when to come back): never an immediate second send.
+            deps.enqueueExposures(body, answer.retryAfter)
         }
     }
 

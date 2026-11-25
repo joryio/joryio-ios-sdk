@@ -25,6 +25,8 @@ final class FlagsTests: XCTestCase {
         var exposureAnswers: [Int] = []
         /// The request whose first exposure is this flag answers 503 once.
         var failOnceStartingAt: String?
+        /// The Retry-After the failed exposures answers carry.
+        var retryAfter: TimeInterval?
 
         func postExposures(_ body: Data) async -> FlagsPostStatus {
             let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:]
@@ -34,9 +36,10 @@ final class FlagsTests: XCTestCase {
             var status = exposureAnswers.isEmpty ? 200 : exposureAnswers.removeFirst()
             if let first, first == failOnceStartingAt { failOnceStartingAt = nil; status = 503 }
             let d = delay
+            let retryAfter = (200...299).contains(status) ? nil : self.retryAfter
             lock.unlock()
             if d > 0 { try? await Task.sleep(nanoseconds: UInt64(d * 1_000_000_000)) }
-            return FlagsPostStatus(status: status)
+            return FlagsPostStatus(status: status, retryAfter: retryAfter)
         }
     }
 
@@ -52,7 +55,12 @@ final class FlagsTests: XCTestCase {
         private let lock = NSLock()
         private var _outbox: [String] = []
         var outboxBodies: [String] { lock.lock(); defer { lock.unlock() }; return _outbox }
-        func addToOutbox(_ body: String) { lock.lock(); _outbox.append(body); lock.unlock() }
+        private var _retryAfters: [TimeInterval?] = []
+        /// The Retry-After handed over with each body.
+        var outboxRetryAfters: [TimeInterval?] { lock.lock(); defer { lock.unlock() }; return _retryAfters }
+        func addToOutbox(_ body: String, retryAfter: TimeInterval? = nil) {
+            lock.lock(); _outbox.append(body); _retryAfters.append(retryAfter); lock.unlock()
+        }
     }
 
     static func flag(_ value: Any, _ type: String, variant: String = "on", log: Bool = true) -> [String: Any] {
@@ -88,7 +96,7 @@ final class FlagsTests: XCTestCase {
             loadExposures: { state.storedExposures },
             saveExposures: { state.storedExposures = $0 },
             postExposures: { await server.postExposures($0) },
-            enqueueExposures: { state.addToOutbox($0) },
+            enqueueExposures: { body, retryAfter in state.addToOutbox(body, retryAfter: retryAfter) },
             pendingExposures: { state.outboxBodies }
         ))
     }
@@ -627,7 +635,8 @@ final class FlagsTests: XCTestCase {
         // Relaunch, the server back: the outbox sends it, once, with its key.
         setExposuresFail(false)
         let (third, storage3) = launch()
-        waitUntil(timeout: 3) { !self.outboxOnDisk(storage3).contains("flagExposures") }
+        // After its first wait (4 s from the failure, stored with the entry).
+        waitUntil(timeout: 8) { !self.outboxOnDisk(storage3).contains("flagExposures") }
         let keys = Set(TestSupport.requests("/v1/flags/exposures").compactMap { $0.json?["idempotencyKey"] as? String })
         XCTAssertEqual(keys, [idempotencyKey!], "one batch, one key")
         let sent = TestSupport.requests("/v1/flags/exposures").count
@@ -681,9 +690,11 @@ final class FlagsTests: XCTestCase {
         let sdk = TestSupport.sdk(storage: storage)
         await sdk.refreshFlags()
         _ = sdk.getBoolFlag("new_checkout", default: false)
-        waitUntil(timeout: 3) { self.outboxOnDisk(storage).contains("flagExposures") && TestSupport.requests("/v1/flags/exposures").count >= 2 }
+        // The direct attempt (503) is through; the outbox waits before its own.
+        waitUntil(timeout: 3) { self.outboxOnDisk(storage).contains("flagExposures") }
         Thread.sleep(forTimeInterval: 0.3)
         let before = TestSupport.requests("/v1/flags/exposures").count
+        XCTAssertEqual(before, 1, "no immediate re-send (1.4.0-beta.14)")
         sdk.wipeData()
         XCTAssertFalse(outboxOnDisk(storage).contains("flagExposures"))
         setExposuresFail(false)
@@ -698,15 +709,200 @@ final class FlagsTests: XCTestCase {
         let sdk = TestSupport.sdk(storage: storage)
         await sdk.refreshFlags()
         _ = sdk.getBoolFlag("new_checkout", default: false)
-        waitUntil(timeout: 3) { self.outboxOnDisk(storage).contains("flagExposures") && TestSupport.requests("/v1/flags/exposures").count >= 2 }
+        // The direct attempt (503) is through; the outbox waits before its own.
+        waitUntil(timeout: 3) { self.outboxOnDisk(storage).contains("flagExposures") }
         Thread.sleep(forTimeInterval: 0.3)
         let before = TestSupport.requests("/v1/flags/exposures").count
+        XCTAssertEqual(before, 1, "no immediate re-send (1.4.0-beta.14)")
         sdk.optOut()
         XCTAssertFalse(outboxOnDisk(storage).contains("flagExposures"))
         sdk.optIn()
         setExposuresFail(false)
         Thread.sleep(forTimeInterval: 1.5)
         XCTAssertEqual(TestSupport.requests("/v1/flags/exposures").count, before)
+    }
+
+    // MARK: 1.4.0-beta.14 - no immediate re-send after a failed direct send
+
+    func testTheFailedAnswersRetryAfterIsHandedToTheOutboxWithTheBatch() async {
+        let server = FakeServer()
+        server.exposureAnswers = [429]
+        server.retryAfter = 10
+        let (m, _, state) = await ready(server)
+        _ = m.getBoolFlag("new_checkout", default: false)
+        waitUntil(timeout: 3) { state.outboxBodies.count == 1 }
+        XCTAssertEqual(state.outboxRetryAfters, [10])
+        Thread.sleep(forTimeInterval: 0.2)
+        XCTAssertEqual(server.calls("/v1/flags/exposures").count, 1, "handed over once, never re-sent by the FlagsManager")
+    }
+
+    /// An outbox on a fake clock; `sent` lists the bodies in the order they went.
+    private final class ClockedOutbox {
+        var clock = Date(timeIntervalSince1970: 1_000_000)
+        var sent: [String] = []
+        var answer: NetworkClient.WriteOutcome = .done
+        lazy var box: WriteOutbox = {
+            let box = WriteOutbox(
+                logger: TestSupport.logger(), load: { .value(nil) }, save: { _ in },
+                sender: { [unowned self] _, body, _ in
+                    self.sent.append(String(decoding: body, as: UTF8.self))
+                    return self.answer
+                }
+            )
+            box.now = { [unowned self] in self.clock }
+            return box
+        }()
+        func exposures(_ key: String) -> OutboxEntry {
+            OutboxEntry(kind: .flagExposures, path: "/v1/flags/exposures", body: key, userId: nil)
+        }
+    }
+
+    func testAfterA503OnTheDirectSendTheFirstOutboxAttemptWaitsTheFirstBackoffStep() async {
+        let o = ClockedOutbox()
+        o.box.addAfterFailedSend(o.exposures("x"))
+        await o.box.drain(force: true)
+        XCTAssertEqual(o.sent, [], "re-sent at once (beta.13)")
+        o.clock += 3.999
+        await o.box.drain(force: true)
+        XCTAssertEqual(o.sent, [])
+        o.clock += 0.001
+        await o.box.drain(force: true)
+        XCTAssertEqual(o.sent, ["x"])
+        XCTAssertEqual(o.box.count, 0)
+    }
+
+    func testA429WithRetryAfter10IsNotRetriedBefore10Seconds() async {
+        let o = ClockedOutbox()
+        o.box.addAfterFailedSend(o.exposures("x"), retryAfter: 10)
+        o.clock += 9.999
+        await o.box.drain(force: true)
+        XCTAssertEqual(o.sent, [])
+        o.clock += 0.001
+        await o.box.drain(force: true)
+        XCTAssertEqual(o.sent, ["x"])
+    }
+
+    func testARetryAfterGivenAsAnHttpDateIsHonoured() async {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        let retryAfter = NetworkClient.parseRetryAfter(formatter.string(from: Date().addingTimeInterval(30)))
+        XCTAssertNotNil(retryAfter)
+        XCTAssertGreaterThan(retryAfter ?? 0, 28)
+        let o = ClockedOutbox()
+        o.box.addAfterFailedSend(o.exposures("x"), retryAfter: retryAfter)
+        o.clock += 27
+        await o.box.drain(force: true)
+        XCTAssertEqual(o.sent, [])
+        o.clock += 4
+        await o.box.drain(force: true)
+        XCTAssertEqual(o.sent, ["x"])
+    }
+
+    func testARetryAfterLongerThanTheOutboxMaximumIsCapped() async {
+        let o = ClockedOutbox()
+        o.box.addAfterFailedSend(o.exposures("x"), retryAfter: 3600)
+        o.clock += WriteOutbox.maxBackoffSeconds - 0.001
+        await o.box.drain(force: true)
+        XCTAssertEqual(o.sent, [])
+        o.clock += 0.001
+        await o.box.drain(force: true)
+        XCTAssertEqual(o.sent, ["x"])
+    }
+
+    func testOnlyThatEntryWaitsTheOthersGoNow() async {
+        let o = ClockedOutbox()
+        o.box.add(o.exposures("before"))
+        o.box.addAfterFailedSend(o.exposures("x"), retryAfter: 10)
+        o.box.add(o.exposures("after"))
+        await o.box.drain()
+        XCTAssertEqual(o.sent, ["before", "after"])
+        XCTAssertEqual(o.box.count, 1)
+    }
+
+    func testItCountsAsFailedOnceSoTheNextBackoffIsTheSecondStep() async {
+        let o = ClockedOutbox()
+        o.answer = .retry(retryAfter: nil, answered: false)
+        o.box.addAfterFailedSend(o.exposures("x"))
+        o.clock += 4
+        let started = Date()
+        await o.box.drain(force: true)
+        XCTAssertEqual(o.sent, ["x"])
+        // failures = 2: 2 s x 2^2. The outbox's own backoff runs on the real clock.
+        o.answer = .done
+        await o.box.drain()
+        XCTAssertEqual(o.sent, ["x"], "the next attempt waits the second step")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 8)
+    }
+
+    func testTheFirstWaitIsStoredWithTheEntrySoARelaunchWaitsItOut() throws {
+        let o = ClockedOutbox()
+        o.box.addAfterFailedSend(o.exposures("x"))
+        let stored = try JSONEncoder().encode(o.box.snapshot())
+        let restored = try JSONDecoder().decode([OutboxEntry].self, from: stored)
+        XCTAssertEqual(restored.first?.firstAttemptNotBefore, o.clock.addingTimeInterval(4))
+        XCTAssertEqual(restored.first?.failures, 1)
+        // An outbox stored by an earlier build has neither field: no wait.
+        let old = #"[{"id":"o","kind":"alias","path":"/v1/alias","body":"{}","attempts":0,"notFoundAttempts":0}]"#
+        let decoded = try JSONDecoder().decode([OutboxEntry].self, from: Data(old.utf8))
+        XCTAssertNil(decoded.first?.firstAttemptNotBefore)
+        XCTAssertNil(decoded.first?.failures)
+    }
+
+    func testAFirstWaitFurtherAwayThanTheMaximumMeansTheClockMovedAndItGoesNow() async {
+        let o = ClockedOutbox()
+        var entry = o.exposures("x")
+        entry.firstAttemptNotBefore = o.clock.addingTimeInterval(WriteOutbox.maxBackoffSeconds + 1)
+        o.box.add(entry)
+        await o.box.drain(force: true)
+        XCTAssertEqual(o.sent, ["x"])
+    }
+
+    /// The stored exposure entries' first-attempt times.
+    private func storedNotBefore(_ storage: StorageManager) -> [Date] {
+        let json = storage.getValue(forKey: Joryio.flagExposuresOutboxStorageKey) ?? "[]"
+        let entries = (try? JSONDecoder().decode([OutboxEntry].self, from: Data(json.utf8))) ?? []
+        return entries.compactMap(\.firstAttemptNotBefore)
+    }
+
+    func testThroughTheSdkA503IsNotResentBeforeTheFirstBackoffStep() async {
+        answerFlagsFailingExposures()
+        let storage = TestSupport.storage()
+        let sdk = TestSupport.sdk(storage: storage)
+        await sdk.refreshFlags()
+        let before = Date()
+        _ = sdk.getBoolFlag("new_checkout", default: false)
+        waitUntil(timeout: 3) { self.outboxOnDisk(storage).contains("flagExposures") }
+        let notBefore = storedNotBefore(storage).first ?? .distantPast
+        XCTAssertGreaterThanOrEqual(notBefore.timeIntervalSince(before), 4 - 0.01)
+        XCTAssertLessThanOrEqual(notBefore.timeIntervalSinceNow, 4)
+        Thread.sleep(forTimeInterval: 1.5)
+        XCTAssertEqual(TestSupport.requests("/v1/flags/exposures").count, 1, "re-sent at once (beta.13)")
+        setExposuresFail(false)
+        waitUntil(timeout: 8) { !self.outboxOnDisk(storage).contains("flagExposures") }
+        XCTAssertEqual(TestSupport.requests("/v1/flags/exposures").count, 2)
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(before), 4)
+        _ = sdk
+    }
+
+    func testThroughTheSdkA429WithRetryAfter10IsNotResentBefore10Seconds() async {
+        answerFlagsFailingExposures()
+        StubURLProtocol.headersFor = { req in
+            req.url!.path.hasSuffix("/v1/flags/exposures") ? ["Retry-After": "10"] : nil
+        }
+        let storage = TestSupport.storage()
+        let sdk = TestSupport.sdk(storage: storage)
+        await sdk.refreshFlags()
+        let before = Date()
+        _ = sdk.getBoolFlag("new_checkout", default: false)
+        waitUntil(timeout: 3) { self.outboxOnDisk(storage).contains("flagExposures") }
+        let notBefore = storedNotBefore(storage).first ?? .distantPast
+        XCTAssertGreaterThanOrEqual(notBefore.timeIntervalSince(before), 10 - 0.01)
+        XCTAssertLessThanOrEqual(notBefore.timeIntervalSinceNow, 10)
+        Thread.sleep(forTimeInterval: 1.5)
+        XCTAssertEqual(TestSupport.requests("/v1/flags/exposures").count, 1)
+        _ = sdk
     }
 
     func testTheSilentPushValueIsPinned() {

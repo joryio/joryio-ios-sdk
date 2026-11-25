@@ -800,7 +800,7 @@ public class Joryio {
             postExposures: { [weak network = self.network] body in await network?.postFlagExposures(body: body) ?? FlagsPostStatus(status: 0) },
             // A batch the server did not take goes to the persisted outbox, as
             // it was sent (1.4.0-beta.13); waiting there counts as exposed.
-            enqueueExposures: { [weak self] body in self?.enqueueFlagExposures(body) },
+            enqueueExposures: { [weak self] body, retryAfter in self?.enqueueFlagExposures(body, retryAfter: retryAfter) },
             pendingExposures: { [weak self] in self?.exposureOutbox?.snapshot().map(\.body) ?? [] }
         ))
         // Not workspace-scoped: another SDK key in this app may have written it.
@@ -1497,7 +1497,11 @@ public class Joryio {
     /// A flag exposures batch the server did not take: into the outbox as it
     /// was sent. At most FLAG_EXPOSURE_MARKS_MAX exposures wait there (the
     /// oldest batch goes first), so exposures never crowd out the profile writes.
-    private func enqueueFlagExposures(_ body: String) {
+    ///
+    /// It counts as having failed once (1.4.0-beta.14): its first outbox
+    /// attempt waits the first backoff step, or the failed send's Retry-After
+    /// when longer - the kick below no longer re-sends it milliseconds later.
+    private func enqueueFlagExposures(_ body: String, retryAfter: TimeInterval? = nil) {
         guard let outbox = exposureOutbox else { return }
         let incoming = exposureMarks(body).count
         while true {
@@ -1507,13 +1511,13 @@ public class Joryio {
             outbox.removeAll { $0.id == oldest.id }
         }
         let ids = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any]
-        outbox.add(OutboxEntry(
+        outbox.addAfterFailedSend(OutboxEntry(
             kind: .flagExposures,
             path: "/v1/flags/exposures",
             body: body,
             userId: ids?["userId"] as? String,
             anonymousId: ids?["anonymousId"] as? String
-        ))
+        ), retryAfter: retryAfter)
         outbox.kick()
     }
 
