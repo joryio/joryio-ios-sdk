@@ -16,6 +16,9 @@ import Foundation
 public enum Cards {
     /// The feed goes to the network at most once per this many seconds; extra calls coalesce.
     public static let CARD_MIN_REFRESH_SECONDS: Int = 30
+    /// A feed request that got no answer (no connection, a 5xx) holds the next one
+    /// back this many seconds instead of `CARD_MIN_REFRESH_SECONDS`. A 429 keeps the full window.
+    public static let CARD_RETRY_AFTER_FAILURE_SECONDS: Int = 3
     /// How long the feed is served from the device cache before it is asked for again (the answer's `ttlSeconds` wins).
     public static let CARD_FEED_TTL_SECONDS: Int = 300
     /// The capability a card-aware SDK declares.

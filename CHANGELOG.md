@@ -2,6 +2,12 @@
 
 ## 1.4.0 - 2026-11-18
 
+Fixed (1.4.0-beta.12): flag exposures are sent once per person, flag and variant per session across an app relaunch. The marks of the exposures already sent were kept in memory only, so an app relaunch inside the same 30-minute session sent them again. The current session's marks are now kept on the device (the SDK's per-workspace storage), stored when their batch is sent (an exposure read just before the app is closed is sent after the relaunch), at most `FLAG_EXPOSURE_MARKS_MAX` (500, the oldest dropped first), and cleared by a new session, `reset()` and `identify()` of a different user. The server also counts an exposure once per person, flag, variant and session, for every SDK version. Wire values are unchanged.
+
+Fixed (1.4.0-beta.12): every flag exposures batch carries an `idempotencyKey` (a UUID per batch), as on Android and the web, so a copy of the request sent again is recorded once by the server.
+
+Fixed (1.4.0-beta.12): a placements or cards request that got no answer (no connection, a 5xx) held the next request back for the whole 30 s refresh window, so the placement read empty for 30 s. After such a failure the next request may go after `Placements.PLACEMENT_RETRY_AFTER_FAILURE_SECONDS` / `Cards.CARD_RETRY_AFTER_FAILURE_SECONDS` (3 s); a 429 still keeps the full window. The same rule on every Joryio SDK.
+
 Fixed (1.4.0-beta.11): Show when - every re-check is registered in the capped waiting list (20, the oldest tracked dropped) when its event is tracked, and runs only if it is still there when the event is delivered. A delivery that waited behind a failing flush and then succeeded used to run its re-check directly, skipping the cap; iOS kept to 20 only by timing. It now holds by construction, as on Android and the web.
 
 Fixed (1.4.0-beta.10): Show when - past 20 waiting re-checks the OLDEST tracked is dropped, whatever order the failed deliveries come back in. Each tracked event re-checks in a Task of its own; the waiting list is now kept in tracking order (a stamp taken when the event is tracked), as on Android, where the out-of-order case was found.

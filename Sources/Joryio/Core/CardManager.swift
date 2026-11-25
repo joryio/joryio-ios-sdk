@@ -274,8 +274,9 @@ final class CardManager {
         // An inbox is personal: without consent the server would answer an
         // empty feed, so nothing is asked (and nobody named).
         guard consentNow == "granted" else { return nil }
+        let sentAt = now()
         let (generationAtStart, sentEtag): (Int, String?) = locked {
-            if cursor == nil { lastNetworkAt = now() }
+            if cursor == nil { lastNetworkAt = sentAt }
             return (generation, cursor == nil ? etag : nil)
         }
         var body: [String: Any] = [
@@ -292,6 +293,15 @@ final class CardManager {
         if let sentEtag, !sentEtag.isEmpty { body["etag"] = sentEtag }
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
         let (status, answer) = await transport.fetchCards(data)
+        if cursor == nil, status == 0 || status >= 500 {
+            // No answer or a server error: the next refresh may go after
+            // CARD_RETRY_AFTER_FAILURE_SECONDS, not the whole window (1.4.0-beta.12).
+            locked {
+                if lastNetworkAt == sentAt {
+                    lastNetworkAt = sentAt - TimeInterval(Cards.CARD_MIN_REFRESH_SECONDS - Cards.CARD_RETRY_AFTER_FAILURE_SECONDS)
+                }
+            }
+        }
         guard (200...299).contains(status), let answer else { return nil }
         guard locked({ generation == generationAtStart }) else { return nil }
         guard let root = (try? JSONSerialization.jsonObject(with: answer)) as? [String: Any] else { return nil }

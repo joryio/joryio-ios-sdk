@@ -23,7 +23,15 @@ import Foundation
    in one `POST /v1/flags/exposures` a second after the first read; each
    batch carries the identity it was read under, so an identify / reset never
    sends one person's exposures as the next, and a batch is dropped when
-   consent is withdrawn before it goes.
+   consent is withdrawn before it goes. Each batch carries an `idempotencyKey`
+   (a UUID): a copy sent again is recorded once by the server.
+ - The "already sent" marks of the current session are kept on disk
+   (`jry_<sdkKey>_flag_exposures`, at most `FLAG_EXPOSURE_MARKS_MAX`), so a
+   relaunch that resumes the same session sends no exposure again (BACKLOG
+   D479). A mark is stored when its batch is SENT, not when it is read: an
+   app killed before the batch goes sends that exposure after the relaunch. A new session starts with none; reset(), identify() of a different
+   user and wipeData() clear them. The server counts an exposure once per
+   person, flag, variant and session either way.
  - Without tracking consent nothing is sent and the getters return the
    in-code default.
  */
@@ -36,6 +44,8 @@ public enum JoryioFlags {
     public static let FLAG_SYNC_PUSH_VALUE = "flags"
     /// Exposures per request (the server's limit).
     static let FLAG_EXPOSURES_PER_CALL_MAX = 100
+    /// "Already sent" exposure marks kept for the current session; the oldest goes first past this.
+    public static let FLAG_EXPOSURE_MARKS_MAX = 500
 }
 
 final class FlagsManager {
@@ -57,12 +67,20 @@ final class FlagsManager {
         var callbackQueue: DispatchQueue = .main
         var now: () -> Date = Date.init
         var exposureFlushDelay: TimeInterval = JoryioFlags.FLAG_EXPOSURE_FLUSH_SECONDS
+        /// The current session's exposure marks on disk (JSON `{"sessionId", "marks"}`).
+        var loadExposures: () -> String? = { nil }
+        var saveExposures: (String?) -> Void = { _ in }
     }
 
     private struct PendingBatch {
         let body: [String: Any]
         let generation: Int
         var exposures: [[String: String]]
+        /// The exposure marks of this batch, stored once it is sent (D479).
+        var marks: [String] = []
+        /// The batch's `idempotencyKey` (1.4.0-beta.12): one UUID per batch, so a
+        /// copy of the request sent again is recorded once by the server.
+        let idempotencyKey = UUID().uuidString.lowercased()
     }
 
     private let deps: Dependencies
@@ -76,8 +94,15 @@ final class FlagsManager {
     private var inflight: Task<Void, Never>?
     private var inflightGeneration = 0
     private var listeners: [UUID: ([String]) -> Void] = [:]
-    /// `<session>|<person>|<flag>|<variant>` already reported.
+    /// `<session>|<person>|<flag>|<variant>` already reported in `exposedSession`,
+    /// kept on disk (D479) so a relaunch in the same session does not report it again.
     private var exposed = Set<String>()
+    /// The same marks, oldest first (the cap drops from the front).
+    private var exposedOrder: [String] = []
+    /// The session the marks belong to; nil until the stored marks are read.
+    private var exposedSession: String?
+    /// The marks of batches already SENT this session - what is kept on disk, oldest first.
+    private var storedMarks: [String] = []
     private var pending: PendingBatch?
     private var flushScheduled = false
 
@@ -88,6 +113,8 @@ final class FlagsManager {
     static func storageKey(sdkKey: String) -> String { "jry_\(sdkKey)_flags_cache" }
     /// The unscoped key of builds before 2026-11-21: never read, removed at start.
     static let legacyStorageKey = "flags_cache"
+    /// The current session's "already sent" exposure marks, per workspace like the answer.
+    static func exposuresStorageKey(sdkKey: String) -> String { "jry_\(sdkKey)_flag_exposures" }
 
     init(_ deps: Dependencies) {
         self.deps = deps
@@ -113,7 +140,10 @@ final class FlagsManager {
     }
 
     /// The person or the consent changed: the held answer belongs to someone else.
-    func onIdentityChanged() {
+    /// `clearExposureMarks`: reset() or identify() of a different user - the
+    /// exposure marks go too (the beta.11 rule for attributes).
+    func onIdentityChanged(clearExposureMarks: Bool = false) {
+        if clearExposureMarks { self.clearExposureMarks() }
         let before: [String] = withLock {
             generation += 1
             return Array(flags.keys)
@@ -139,9 +169,42 @@ final class FlagsManager {
             flags = [:]
             etag = ""
             fetchedAt = nil
-            exposed.removeAll()
         }
         deps.save(nil)
+        clearExposureMarks()
+    }
+
+    /// Forget the exposure marks, in memory and on disk.
+    private func clearExposureMarks() {
+        withLock {
+            exposed.removeAll()
+            exposedOrder.removeAll()
+            storedMarks.removeAll()
+            exposedSession = ""
+        }
+        deps.saveExposures(nil)
+    }
+
+    /// Under the lock: the marks belong to `session`. The stored marks are read
+    /// once (kept only when they are this session's); another session's are dropped.
+    private func adoptExposureSession(_ session: String) {
+        if exposedSession == nil {
+            exposedSession = ""
+            if let raw = deps.loadExposures(), let data = raw.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               (obj["sessionId"] as? String) == session, let marks = obj["marks"] as? [String] {
+                exposedOrder = Array(marks.suffix(JoryioFlags.FLAG_EXPOSURE_MARKS_MAX))
+                storedMarks = exposedOrder
+                exposed = Set(exposedOrder)
+                exposedSession = session
+            }
+        }
+        if exposedSession != session {
+            exposed.removeAll()
+            exposedOrder.removeAll()
+            storedMarks.removeAll()
+            exposedSession = session
+        }
     }
 
     // MARK: - Reading
@@ -227,19 +290,26 @@ final class FlagsManager {
         // `logExposure: false` = sampled out on the server; absent = log.
         if let log = f["logExposure"] as? Bool, !log { return }
         let variant = (f["variant"] as? String) ?? ""
-        let mark = "\(deps.sessionId())|\(subjectKey())|\(key)|\(variant)"
+        let session = deps.sessionId()
+        let mark = "\(session)|\(subjectKey())|\(key)|\(variant)"
         let body = requestBody()
         var previous: PendingBatch?
         var schedule = false
         withLock {
+            adoptExposureSession(session)
             guard !exposed.contains(mark) else { return }
             exposed.insert(mark)
+            exposedOrder.append(mark)
+            while exposedOrder.count > JoryioFlags.FLAG_EXPOSURE_MARKS_MAX {
+                exposed.remove(exposedOrder.removeFirst())
+            }
             if pending == nil || pending?.generation != generation {
                 // A batch from before an identity change goes first, as its own person.
                 previous = pending
                 pending = PendingBatch(body: body, generation: generation, exposures: [])
             }
             pending?.exposures.append(["key": key, "variant": variant])
+            pending?.marks.append(mark)
             if !flushScheduled {
                 flushScheduled = true
                 schedule = true
@@ -269,9 +339,27 @@ final class FlagsManager {
         guard !batch.exposures.isEmpty, deps.canSend() else { return }
         var body = batch.body
         body["exposures"] = Array(batch.exposures.prefix(JoryioFlags.FLAG_EXPOSURES_PER_CALL_MAX))
+        body["idempotencyKey"] = batch.idempotencyKey
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
         let post = deps.post
         Task { _ = await post("/v1/flags/exposures", data) }
+        storeSent(batch.marks)
+    }
+
+    /// A batch went out: its marks (of the current session only) are kept on disk.
+    private func storeSent(_ marks: [String]) {
+        let stored: String? = withLock {
+            guard let session = exposedSession, !session.isEmpty else { return nil }
+            let mine = marks.filter { $0.hasPrefix("\(session)|") && !storedMarks.contains($0) }
+            guard !mine.isEmpty else { return nil }
+            storedMarks.append(contentsOf: mine)
+            if storedMarks.count > JoryioFlags.FLAG_EXPOSURE_MARKS_MAX {
+                storedMarks.removeFirst(storedMarks.count - JoryioFlags.FLAG_EXPOSURE_MARKS_MAX)
+            }
+            guard let data = try? JSONSerialization.data(withJSONObject: ["sessionId": session, "marks": storedMarks]) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }
+        if let stored { deps.saveExposures(stored) }
     }
 
     private func subjectKey() -> String {

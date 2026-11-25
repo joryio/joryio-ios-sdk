@@ -780,7 +780,9 @@ public class Joryio {
             attributes: { [weak identity = self.identity] in identity?.getUserAttributes() ?? [:] },
             context: { Self.flagsContext() },
             load: { [weak storage = self.storage] in storage?.getValue(forKey: FlagsManager.storageKey(sdkKey: sdkKey)) },
-            save: { [weak storage = self.storage] in storage?.setValue($0, forKey: FlagsManager.storageKey(sdkKey: sdkKey)) }
+            save: { [weak storage = self.storage] in storage?.setValue($0, forKey: FlagsManager.storageKey(sdkKey: sdkKey)) },
+            loadExposures: { [weak storage = self.storage] in storage?.getValue(forKey: FlagsManager.exposuresStorageKey(sdkKey: sdkKey)) },
+            saveExposures: { [weak storage = self.storage] in storage?.setValue($0, forKey: FlagsManager.exposuresStorageKey(sdkKey: sdkKey)) }
         ))
         // Not workspace-scoped: another SDK key in this app may have written it.
         storage.setValue(nil, forKey: FlagsManager.legacyStorageKey)
@@ -1264,6 +1266,7 @@ public class Joryio {
         // NEW user (`plan` of one person written on another's profile), and
         // their queued events were sent with the new user's token, refused,
         // and dropped.
+        let switchingUser = identity.getUserId().map { $0 != userId } ?? false
         if let previous = identity.getUserId(), previous != userId {
             handOverPreviousUser(previous, to: userId)
         }
@@ -1282,8 +1285,9 @@ public class Joryio {
         placementManager?.invalidate()
         // A new person: the anonymous visitor's read / dismissed state goes too.
         cardManager?.invalidate(clearDeviceState: true)
-        // Flags: the held answer was the previous identity's.
-        flagsManager?.onIdentityChanged()
+        // Flags: the held answer was the previous identity's; another user's
+        // exposure marks go too (D479, the beta.11 attribute rule).
+        flagsManager?.onIdentityChanged(clearExposureMarks: switchingUser)
 
         // Re-register the stored device token against the new identity so a
         // token first captured while anonymous becomes bound to this user.
@@ -1644,8 +1648,9 @@ public class Joryio {
         inAppMessaging.clear()
         placementManager?.invalidate()
         cardManager?.invalidate(clearDeviceState: true)
-        // Nor the previous user's flags; their unsent exposures go as them.
-        flagsManager?.onIdentityChanged()
+        // Nor the previous user's flags; their unsent exposures go as them,
+        // and their exposure marks are forgotten (D479).
+        flagsManager?.onIdentityChanged(clearExposureMarks: true)
 
         // Now send what the outgoing identity left queued.
         queue.flushSync()

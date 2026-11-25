@@ -165,6 +165,31 @@ final class CardManagerTests: XCTestCase {
         XCTAssertEqual(f.stateScope, "server")
     }
 
+    /// 1.4.0-beta.11 test (Android): a failed feed request blocked the next one for the whole 30 s window.
+    func testAFailedRequestDoesNotBlockARefetchForTheWholeWindow() async {
+        XCTAssertEqual(Cards.CARD_RETRY_AFTER_FAILURE_SECONDS, 3)
+        var status = 0
+        let t = FakeTransport { _ in status == 200 ? self.feed([self.card("a")], unread: 1) : (status, nil) }
+        let m = manager(t)
+        let empty = await m.getCards()
+        XCTAssertTrue(empty.cards.isEmpty)
+        status = 200
+        clock += 1
+        _ = await m.getCards()
+        XCTAssertEqual(t.fetches.count, 1, "inside the short backoff: not asked again")
+        clock += TimeInterval(Cards.CARD_RETRY_AFTER_FAILURE_SECONDS)
+        let f = await m.getCards()
+        XCTAssertEqual(t.fetches.count, 2)
+        XCTAssertEqual(f.cards.map { $0.id }, ["a"])
+        // A 429 keeps the whole window.
+        status = 429
+        clock += 301
+        _ = await m.getCards()
+        clock += TimeInterval(Cards.CARD_RETRY_AFTER_FAILURE_SECONDS) + 0.5
+        _ = await m.getCards()
+        XCTAssertEqual(t.fetches.count, 3)
+    }
+
     func testServesTheCacheForTheTtlAndCoalescesRefreshes() async {
         let t = FakeTransport { _ in self.feed([self.card("a")], unread: 1) }
         let m = manager(t)

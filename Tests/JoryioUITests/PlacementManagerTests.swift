@@ -152,6 +152,38 @@ final class PlacementManagerTests: XCTestCase {
         XCTAssertEqual(r["home_hero"]?.items.map { $0.id }, ["camp-1"])
     }
 
+    /// 1.4.0-beta.11 test (Android): a failed request stamped its keys for the whole
+    /// 30 s window, so they read empty for 30 s. No answer (or a 5xx) holds them
+    /// back only PLACEMENT_RETRY_AFTER_FAILURE_SECONDS; a 429 keeps the window.
+    func testAFailedRequestDoesNotBlockARefetchForTheWholeWindow() async {
+        XCTAssertEqual(Placements.PLACEMENT_RETRY_AFTER_FAILURE_SECONDS, 3)
+        var status = 0
+        let t = FakeTransport { _ in status == 200 ? self.answer(self.hero()) : (status, nil) }
+        let m = manager(t)
+        let empty = await m.getPlacements(["home_hero"])
+        XCTAssertEqual(empty["home_hero"]?.items.count ?? 0, 0)
+        status = 200
+        clock += 1
+        _ = await m.getPlacements(["home_hero"])
+        XCTAssertEqual(t.fetches.count, 1, "inside the short backoff: not asked again")
+        clock += TimeInterval(Placements.PLACEMENT_RETRY_AFTER_FAILURE_SECONDS)
+        let r = await m.getPlacements(["home_hero"])
+        XCTAssertEqual(t.fetches.count, 2)
+        XCTAssertEqual(r["home_hero"]?.items.map { $0.id }, ["camp-1"])
+    }
+
+    func testA429KeepsTheWholeRefreshWindow() async {
+        let t = FakeTransport { _ in (429, nil) }
+        let m = manager(t)
+        _ = await m.getPlacements(["home_hero"])
+        clock += TimeInterval(Placements.PLACEMENT_RETRY_AFTER_FAILURE_SECONDS) + 0.5
+        _ = await m.getPlacements(["home_hero"])
+        XCTAssertEqual(t.fetches.count, 1)
+        clock += TimeInterval(Placements.PLACEMENT_MIN_REFRESH_SECONDS)
+        _ = await m.getPlacements(["home_hero"])
+        XCTAssertEqual(t.fetches.count, 2)
+    }
+
     func testWithoutConsentTheRequestNamesNobodyAndNothingIsReported() async {
         consentValue = "denied"
         let t = FakeTransport { _ in self.answer(self.hero()) }

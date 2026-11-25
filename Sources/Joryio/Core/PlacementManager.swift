@@ -584,7 +584,7 @@ final class PlacementManager: PlacementReporter {
     private func request(_ keys: [String], recheckEvent: [String: Any]? = nil) async {
         guard let consentNow = consent() else { return }
         let personal = consentNow == "granted"
-        let (generationAtStart, seq, shown): (Int, Int, [String: [String]]) = locked {
+        let (generationAtStart, seq, shown, sentAt): (Int, Int, [String: [String]], TimeInterval) = locked {
             requestSeq += 1
             let t = now()
             for key in keys { lastNetworkAt[key] = t }
@@ -593,7 +593,7 @@ final class PlacementManager: PlacementReporter {
                 let ids = host.shownIds()
                 if !ids.isEmpty { shown[host.placementKey] = ids }
             }
-            return (generation, requestSeq, shown)
+            return (generation, requestSeq, shown, t)
         }
         var body: [String: Any] = [
             "deviceType": "ios",
@@ -613,6 +613,16 @@ final class PlacementManager: PlacementReporter {
         if let recheckEvent, JSONSerialization.isValidJSONObject(recheckEvent) { body["recheckEvent"] = recheckEvent }
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
         let (status, answer) = await transport.fetchPlacements(data)
+        if status == 0 || status >= 500 {
+            // No answer or a server error: the keys may go again after
+            // PLACEMENT_RETRY_AFTER_FAILURE_SECONDS, not the whole refresh window
+            // (1.4.0-beta.12). A 429 or another 4xx keeps the window.
+            locked {
+                let retryAt = sentAt - TimeInterval(Placements.PLACEMENT_MIN_REFRESH_SECONDS - Placements.PLACEMENT_RETRY_AFTER_FAILURE_SECONDS)
+                for key in keys where lastNetworkAt[key] == sentAt { lastNetworkAt[key] = retryAt }
+            }
+            return
+        }
         guard (200...299).contains(status), let answer,
               let root = (try? JSONSerialization.jsonObject(with: answer)) as? [String: Any] else { return }
         if (root["success"] as? Bool) == false { return }

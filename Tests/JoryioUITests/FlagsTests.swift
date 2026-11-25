@@ -28,6 +28,7 @@ final class FlagsTests: XCTestCase {
         var anonymousId = "anon-1"
         var sessionId = "s-1"
         var stored: String?
+        var storedExposures: String?
         var now = Date()
     }
 
@@ -60,7 +61,9 @@ final class FlagsTests: XCTestCase {
             save: { state.stored = $0 },
             callbackQueue: DispatchQueue.global(),
             now: { state.now },
-            exposureFlushDelay: 0.05
+            exposureFlushDelay: 0.05,
+            loadExposures: { state.storedExposures },
+            saveExposures: { state.storedExposures = $0 }
         ))
     }
 
@@ -153,6 +156,11 @@ final class FlagsTests: XCTestCase {
         state.sessionId = "s-2"
         _ = m.getBoolFlag("new_checkout", default: false)
         waitUntil(timeout: 2) { server.calls("/v1/flags/exposures").count == 2 }
+        // 1.4.0-beta.12: one idempotencyKey (a lowercase UUID) per batch, the same wire value as Android and the web.
+        let keys = server.calls("/v1/flags/exposures").compactMap { $0["idempotencyKey"] as? String }
+        XCTAssertEqual(keys.count, 2)
+        XCTAssertEqual(Set(keys).count, 2, "one key per batch")
+        for k in keys { XCTAssertNotNil(k.range(of: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", options: .regularExpression), k) }
     }
 
     func testGetAllFlagsLogsNoExposure() async {
@@ -255,6 +263,114 @@ final class FlagsTests: XCTestCase {
         await m.refreshFlags()
         Thread.sleep(forTimeInterval: 0.2)
         lock.lock(); XCTAssertEqual(received.count, 2); lock.unlock()
+    }
+
+    // MARK: - Exposure marks kept for the session (BACKLOG D479)
+
+    /// A relaunch: a new FlagsManager over the same store, the session resumed.
+    private func relaunch(_ server: FakeServer, _ state: State) async -> FlagsManager {
+        let m = manager(server, state)
+        await m.refreshFlags()
+        return m
+    }
+
+    func testARelaunchInTheSameSessionSendsNoDuplicateExposure() async {
+        let (m, server, state) = await ready()
+        _ = m.getBoolFlag("new_checkout", default: false)
+        waitUntil(timeout: 2) { server.calls("/v1/flags/exposures").count == 1 && state.storedExposures != nil }
+        XCTAssertNotNil(state.storedExposures)
+        let m2 = await relaunch(server, state)
+        _ = m2.getBoolFlag("new_checkout", default: false)
+        _ = m2.getStringFlag("headline", default: "")
+        waitUntil(timeout: 2) { server.calls("/v1/flags/exposures").count == 2 }
+        Thread.sleep(forTimeInterval: 0.2)
+        let second = server.calls("/v1/flags/exposures")[1]["exposures"] as? [[String: String]] ?? []
+        XCTAssertEqual(second.map { $0["key"]! }, ["headline"], "new_checkout was already sent this session")
+        XCTAssertEqual(server.calls("/v1/flags/exposures").count, 2)
+        _ = m
+    }
+
+    func testAMarkIsStoredOnlyOnceItsBatchIsSentSoAKilledAppSendsItAfterTheRelaunch() async {
+        let server = FakeServer()
+        server.answer = Self.answer
+        let state = State()
+        let m = FlagsManager(FlagsManager.Dependencies(
+            post: { await server.post($0, $1) },
+            canSend: { state.canSend },
+            userId: { state.userId },
+            anonymousId: { state.anonymousId },
+            sessionId: { state.sessionId },
+            attributes: { [:] },
+            context: { [:] },
+            load: { state.stored },
+            save: { state.stored = $0 },
+            callbackQueue: DispatchQueue.global(),
+            now: { state.now },
+            exposureFlushDelay: 60, // the app is killed before the batch goes
+            loadExposures: { state.storedExposures },
+            saveExposures: { state.storedExposures = $0 }
+        ))
+        await m.refreshFlags()
+        _ = m.getBoolFlag("new_checkout", default: false)
+        _ = m.getBoolFlag("new_checkout", default: false) // no duplicate within the process
+        XCTAssertNil(state.storedExposures, "not stored before the batch is sent")
+        let m2 = await relaunch(server, state)
+        _ = m2.getBoolFlag("new_checkout", default: false)
+        waitUntil(timeout: 2) { server.calls("/v1/flags/exposures").count == 1 }
+        let sent = server.calls("/v1/flags/exposures")[0]["exposures"] as? [[String: String]] ?? []
+        XCTAssertEqual(sent.map { $0["key"]! }, ["new_checkout"], "the exposure the killed app never sent goes after the relaunch")
+        XCTAssertTrue(state.storedExposures?.contains("|new_checkout|on") ?? false)
+        _ = m
+    }
+
+    func testARelaunchInANewSessionSendsAgainAndDropsTheOldMarks() async {
+        let (m, server, state) = await ready()
+        _ = m.getBoolFlag("new_checkout", default: false)
+        waitUntil(timeout: 2) { server.calls("/v1/flags/exposures").count == 1 }
+        state.sessionId = "s-2"
+        let m2 = await relaunch(server, state)
+        _ = m2.getBoolFlag("new_checkout", default: false)
+        waitUntil(timeout: 2) { state.storedExposures?.contains("s-2|") ?? false }
+        XCTAssertFalse(state.storedExposures?.contains("s-1|") ?? true, "only the current session's marks are kept")
+        XCTAssertTrue(state.storedExposures?.contains("s-2|") ?? false)
+        _ = m
+    }
+
+    func testResetAndAUserSwitchClearTheMarksButSignInDoesNot() async {
+        let (m, server, state) = await ready()
+        _ = m.getBoolFlag("new_checkout", default: false)
+        waitUntil(timeout: 2) { server.calls("/v1/flags/exposures").count == 1 && state.storedExposures != nil }
+        // Anonymous -> signed in: the marks stay (the beta.11 rule clears only on a different user).
+        m.onIdentityChanged(clearExposureMarks: false)
+        XCTAssertNotNil(state.storedExposures)
+        // A different user (or reset()): cleared on disk and in memory.
+        m.onIdentityChanged(clearExposureMarks: true)
+        XCTAssertNil(state.storedExposures)
+        await m.refreshFlags()
+        _ = m.getBoolFlag("new_checkout", default: false)
+        waitUntil(timeout: 2) { server.calls("/v1/flags/exposures").count == 2 }
+        // wipeData() clears them too.
+        m.wipe()
+        XCTAssertNil(state.storedExposures)
+    }
+
+    func testTheStoredMarksAreCappedOldestFirst() async {
+        XCTAssertEqual(JoryioFlags.FLAG_EXPOSURE_MARKS_MAX, 500)
+        let server = FakeServer()
+        var flags: [String: Any] = [:]
+        for i in 0..<(JoryioFlags.FLAG_EXPOSURE_MARKS_MAX + 5) { flags["f\(i)"] = Self.flag(true, "boolean") }
+        server.answer = ["etag": "e", "ttlSeconds": 300, "flags": flags]
+        let state = State()
+        let m = manager(server, state)
+        await m.refreshFlags()
+        for i in 0..<(JoryioFlags.FLAG_EXPOSURE_MARKS_MAX + 5) { _ = m.getBoolFlag("f\(i)", default: false) }
+        m.flush()
+        let obj = (try? JSONSerialization.jsonObject(with: Data((state.storedExposures ?? "").utf8))) as? [String: Any]
+        let marks = obj?["marks"] as? [String] ?? []
+        XCTAssertEqual(obj?["sessionId"] as? String, "s-1")
+        XCTAssertEqual(marks.count, JoryioFlags.FLAG_EXPOSURE_MARKS_MAX)
+        XCTAssertFalse(marks.contains("s-1|anon-1|f0|on") || marks.contains("s-1||anon-1|f0|on"), "the oldest went first")
+        XCTAssertTrue(marks.contains { $0.hasSuffix("|f504|on") })
     }
 
     func testWipeForgetsTheAnswerOnDisk() async {
