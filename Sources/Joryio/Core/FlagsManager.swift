@@ -32,6 +32,17 @@ import Foundation
    app killed before the batch goes sends that exposure after the relaunch. A new session starts with none; reset(), identify() of a different
    user and wipeData() clear them. The server counts an exposure once per
    person, flag, variant and session either way.
+- A mark is stored only once the server took its batch
+  (`exposureBatchSettled`: a 2xx, or a 4xx other than 408 / 429). A batch that
+  got no answer, a 5xx, a 408 or a 429 is handed, with the SAME body and
+  `idempotencyKey`, to the SDK's persisted exposures outbox - the write
+  outbox's sibling under its own key `flag_exposures_outbox` (kind
+  `flagExposures`), so an earlier SDK after a rollback still decodes its
+  write outbox - which retries it on its backoff, across relaunches, and
+  discards it on wipeData(), an opt-out or a denied consent; its marks are
+  stored when the outbox settles it. While it waits there it counts as
+  already exposed (its marks are read from the outbox), so a read does not
+  queue it twice.
  - Without tracking consent nothing is sent and the getters return the
    in-code default.
  */
@@ -48,9 +59,44 @@ public enum JoryioFlags {
     public static let FLAG_EXPOSURE_MARKS_MAX = 500
 }
 
+/// One exposures request's answer: the HTTP status (0 = no answer) and the server's Retry-After.
+struct FlagsPostStatus: Equatable {
+    let status: Int
+    var retryAfter: TimeInterval?
+}
+
+/// Whether an exposures batch is finished with after an answer of `status`
+/// (0 = no answer): a 2xx, or a 4xx other than 408 / 429 - a refusal a retry
+/// would not change, as the write outbox drops one. A network failure, a 5xx,
+/// a 408 or a 429 keeps the batch for a retry. The same rule, under the same
+/// name, on Android and the web.
+func exposureBatchSettled(_ status: Int) -> Bool {
+    switch status {
+    case 200...299: return true
+    case 408, 429: return false
+    case 400...499: return true
+    default: return false
+    }
+}
+
+/// The marks of an exposures request body: `<session>|<user>|<anonymous>|<flag>|<variant>`,
+/// from the identity the batch carries. The same on Android and the web.
+func exposureMarks(_ body: String) -> [String] {
+    guard let data = body.data(using: .utf8),
+          let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let list = o["exposures"] as? [[String: Any]] else { return [] }
+    let head = "\(o["sessionId"] as? String ?? "")|\(o["userId"] as? String ?? "")|\(o["anonymousId"] as? String ?? "")"
+    return list.compactMap { e in
+        guard let key = e["key"] as? String else { return nil }
+        return "\(head)|\(key)|\(e["variant"] as? String ?? "")"
+    }
+}
+
 final class FlagsManager {
     /// The network: POST a JSON body, answer the decoded JSON object or nil.
     typealias Post = (_ path: String, _ body: Data) async -> [String: Any]?
+    /// POST an exposures batch: the HTTP status (0 = no answer) and Retry-After.
+    typealias PostExposures = (_ body: Data) async -> FlagsPostStatus
 
     struct Dependencies {
         var post: Post
@@ -70,17 +116,41 @@ final class FlagsManager {
         /// The current session's exposure marks on disk (JSON `{"sessionId", "marks"}`).
         var loadExposures: () -> String? = { nil }
         var saveExposures: (String?) -> Void = { _ in }
+        /// Nil: `post`, a 200 when it answered and 0 when it did not.
+        var postExposures: PostExposures?
+        /// Hand a batch the server did not take to the persisted write outbox (same body, same key).
+        var enqueueExposures: (String) -> Void = { _ in }
+        /// The bodies of the exposure batches waiting in the write outbox.
+        var pendingExposures: () -> [String] = { [] }
     }
 
     private struct PendingBatch {
         let body: [String: Any]
         let generation: Int
+        /// `wipes` when the batch was made: one read before wipeData() is never handed to the outbox.
+        let wipe: Int
         var exposures: [[String: String]]
         /// The exposure marks of this batch, stored once it is sent (D479).
         var marks: [String] = []
-        /// The batch's `idempotencyKey` (1.4.0-beta.12): one UUID per batch, so a
+        /// The batch's `idempotencyKey` (1.4.0-beta.12): one UUID per request, so a
         /// copy of the request sent again is recorded once by the server.
-        let idempotencyKey = UUID().uuidString.lowercased()
+        var idempotencyKey = UUID().uuidString.lowercased()
+    }
+
+    /// `batch` as requests of at most FLAG_EXPOSURES_PER_CALL_MAX exposures,
+    /// each with its own idempotencyKey (the first keeps the batch's) and its
+    /// own marks: each is settled, kept and retried on its own. The same on
+    /// Android and the web.
+    private static func splitExposureBatch(_ batch: PendingBatch) -> [PendingBatch] {
+        let max = JoryioFlags.FLAG_EXPOSURES_PER_CALL_MAX
+        return stride(from: 0, to: batch.exposures.count, by: max).map { i in
+            let end = min(i + max, batch.exposures.count)
+            var chunk = batch
+            chunk.exposures = Array(batch.exposures[i..<end])
+            chunk.marks = Array(batch.marks[i..<end])
+            if i > 0 { chunk.idempotencyKey = UUID().uuidString.lowercased() }
+            return chunk
+        }
     }
 
     private let deps: Dependencies
@@ -105,6 +175,8 @@ final class FlagsManager {
     private var storedMarks: [String] = []
     private var pending: PendingBatch?
     private var flushScheduled = false
+    /// Bumped by wipe(): a batch read before it is never handed to the outbox.
+    private var wipes = 0
 
     /// The cached answer is per workspace: the key carries the SDK key, like
     /// every other key StorageManager keeps (`jry_<sdkKey>_...`), because the
@@ -164,6 +236,10 @@ final class FlagsManager {
     /// wipeData(): forget the answer and the reports, keep the listeners.
     func wipe() {
         withLock {
+            // No exposure read before the wipe is sent: the queued batch goes,
+            // and one on the wire is not handed to the outbox (whose own
+            // entries the wipe discards with its other writes).
+            wipes += 1
             generation += 1
             pending = nil
             flags = [:]
@@ -177,6 +253,8 @@ final class FlagsManager {
     /// Forget the exposure marks, in memory and on disk.
     private func clearExposureMarks() {
         withLock {
+            // Batches already made still go, as the person who read them;
+            // their marks are not stored (storeMarks keeps the current person's only).
             exposed.removeAll()
             exposedOrder.removeAll()
             storedMarks.removeAll()
@@ -293,10 +371,18 @@ final class FlagsManager {
         let session = deps.sessionId()
         let mark = "\(session)|\(subjectKey())|\(key)|\(variant)"
         let body = requestBody()
+        // Waiting in the write outbox counts as exposed: looked up on a miss
+        // (once per flag and variant per session), outside the lock.
+        let known = withLock { exposedSession == session && exposed.contains(mark) }
+        let waiting = !known && deps.pendingExposures().contains { exposureMarks($0).contains(mark) }
         var previous: PendingBatch?
         var schedule = false
         withLock {
             adoptExposureSession(session)
+            if waiting, !exposed.contains(mark) {
+                exposed.insert(mark)
+                exposedOrder.append(mark)
+            }
             guard !exposed.contains(mark) else { return }
             exposed.insert(mark)
             exposedOrder.append(mark)
@@ -306,7 +392,7 @@ final class FlagsManager {
             if pending == nil || pending?.generation != generation {
                 // A batch from before an identity change goes first, as its own person.
                 previous = pending
-                pending = PendingBatch(body: body, generation: generation, exposures: [])
+                pending = PendingBatch(body: body, generation: generation, wipe: wipes, exposures: [])
             }
             pending?.exposures.append(["key": key, "variant": variant])
             pending?.marks.append(mark)
@@ -337,22 +423,64 @@ final class FlagsManager {
     private func send(_ batch: PendingBatch) {
         // Consent withdrawn since the reads: nothing is sent.
         guard !batch.exposures.isEmpty, deps.canSend() else { return }
-        var body = batch.body
-        body["exposures"] = Array(batch.exposures.prefix(JoryioFlags.FLAG_EXPOSURES_PER_CALL_MAX))
-        body["idempotencyKey"] = batch.idempotencyKey
-        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
-        let post = deps.post
-        Task { _ = await post("/v1/flags/exposures", data) }
-        storeSent(batch.marks)
+        // One request after the other, in reading order.
+        Task { for chunk in Self.splitExposureBatch(batch) { await self.post(chunk) } }
     }
 
-    /// A batch went out: its marks (of the current session only) are kept on disk.
-    private func storeSent(_ marks: [String]) {
+    /// The batch's request body: the same bytes, the same idempotencyKey, on every retry.
+    private static func requestData(_ batch: PendingBatch) -> Data? {
+        var body = batch.body
+        body["exposures"] = batch.exposures
+        body["idempotencyKey"] = batch.idempotencyKey
+        return try? JSONSerialization.data(withJSONObject: body)
+    }
+
+    /// One POST of `batch`. Its marks are stored only once the server took it
+    /// (`exposureBatchSettled`); otherwise the write outbox gets it, with the
+    /// same idempotencyKey.
+    private func post(_ batch: PendingBatch) async {
+        guard let data = Self.requestData(batch) else { return }
+        let answer: FlagsPostStatus
+        if let postExposures = deps.postExposures {
+            answer = await postExposures(data)
+        } else {
+            answer = FlagsPostStatus(status: await deps.post("/v1/flags/exposures", data) != nil ? 200 : 0)
+        }
+        // Taken - or refused for good (a 4xx other than 408 / 429): never sent again.
+        if exposureBatchSettled(answer.status) {
+            storeMarks(batch.marks)
+            return
+        }
+        // Not taken: the persisted outbox retries it, same body and key - unless
+        // the data was wiped or sending stopped (opt-out, consent) meanwhile.
+        if withLock({ batch.wipe == wipes }), deps.canSend(), let body = String(data: data, encoding: .utf8) {
+            deps.enqueueExposures(body)
+        }
+    }
+
+    /// The write outbox settled an exposures batch (taken, or refused for good): its marks are stored.
+    func exposuresSettled(_ body: String) {
+        storeMarks(exposureMarks(body))
+    }
+
+    /// The server took a batch (directly or through the outbox): its marks are
+    /// kept on disk. Only the current session's and person's: a batch of the
+    /// previous person (reset, another user) stores none.
+    private func storeMarks(_ marks: [String]) {
+        let subject = subjectKey()
+        let current = deps.sessionId()
         let stored: String? = withLock {
+            // Settled by the outbox before this launch read a flag: the session's stored marks first.
+            adoptExposureSession(current)
             guard let session = exposedSession, !session.isEmpty else { return nil }
-            let mine = marks.filter { $0.hasPrefix("\(session)|") && !storedMarks.contains($0) }
+            let mine = marks.filter { $0.hasPrefix("\(session)|\(subject)|") && !storedMarks.contains($0) }
             guard !mine.isEmpty else { return nil }
             storedMarks.append(contentsOf: mine)
+            // Known as sent in this process too (an outbox settle can come before any read).
+            for m in mine where !exposed.contains(m) {
+                exposed.insert(m)
+                exposedOrder.append(m)
+            }
             if storedMarks.count > JoryioFlags.FLAG_EXPOSURE_MARKS_MAX {
                 storedMarks.removeFirst(storedMarks.count - JoryioFlags.FLAG_EXPOSURE_MARKS_MAX)
             }

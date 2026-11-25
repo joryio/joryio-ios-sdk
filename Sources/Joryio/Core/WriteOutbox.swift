@@ -15,6 +15,11 @@ struct OutboxEntry: Codable, Equatable {
         /// identified someone else without reset() - sent under THAT
         /// user's ids (SDK contract v5, 53).
         case attributes
+        /// A flag exposures batch the server did not take at once
+        /// (1.4.0-beta.13): the request body as sent, retried as it is;
+        /// discarded with the other collection on an opt-out, a denied consent
+        /// and wipeData().
+        case flagExposures
     }
 
     let id: String
@@ -78,7 +83,7 @@ struct OutboxEntry: Codable, Equatable {
     /// withdraw, and are always delivered (contract v4, 36).
     var isCollection: Bool {
         switch kind {
-        case .identify, .alias, .attributes: return true
+        case .identify, .alias, .attributes, .flagExposures: return true
         case .subscription: return withdrawal != true
         case .optOutMarker, .pushUnregister: return false
         }

@@ -105,6 +105,12 @@ public class Joryio {
     /// identify, addAlias, subscription changes and the opt-out record,
     /// persisted until the server acknowledges them (SDK contract 28).
     private var outbox: WriteOutbox!
+    /// Flag exposure batches the server did not take (1.4.0-beta.13): a
+    /// sibling of `outbox` with the same rules (retry, backoff, identity,
+    /// purge), stored under its OWN key. An SDK before 1.4.0-beta.13 never
+    /// reads that key, so a rollback keeps its write outbox decodable - one
+    /// list holding an entry kind it does not know would be discarded whole.
+    private var exposureOutbox: WriteOutbox!
 
     private func locked<T>(_ body: () -> T) -> T {
         stateLock.lock()
@@ -715,6 +721,14 @@ public class Joryio {
                 await network?.sendWrite(path: path, body: body, userId: userId) ?? .retry(retryAfter: nil, answered: false)
             }
         )
+        self.exposureOutbox = WriteOutbox(
+            logger: logger,
+            load: { [weak storage = self.storage] in storage?.readValue(forKey: Self.flagExposuresOutboxStorageKey) ?? .unavailable },
+            save: { [weak storage = self.storage] in storage?.setValue($0, forKey: Self.flagExposuresOutboxStorageKey) },
+            sender: { [weak network = self.network] path, body, userId in
+                await network?.sendWrite(path: path, body: body, userId: userId) ?? .retry(retryAfter: nil, answered: false)
+            }
+        )
         let inAppConfig = self.config.inApp
         self.inAppMessaging = InAppMessagingManager(
             networkClient: network,
@@ -782,7 +796,12 @@ public class Joryio {
             load: { [weak storage = self.storage] in storage?.getValue(forKey: FlagsManager.storageKey(sdkKey: sdkKey)) },
             save: { [weak storage = self.storage] in storage?.setValue($0, forKey: FlagsManager.storageKey(sdkKey: sdkKey)) },
             loadExposures: { [weak storage = self.storage] in storage?.getValue(forKey: FlagsManager.exposuresStorageKey(sdkKey: sdkKey)) },
-            saveExposures: { [weak storage = self.storage] in storage?.setValue($0, forKey: FlagsManager.exposuresStorageKey(sdkKey: sdkKey)) }
+            saveExposures: { [weak storage = self.storage] in storage?.setValue($0, forKey: FlagsManager.exposuresStorageKey(sdkKey: sdkKey)) },
+            postExposures: { [weak network = self.network] body in await network?.postFlagExposures(body: body) ?? FlagsPostStatus(status: 0) },
+            // A batch the server did not take goes to the persisted outbox, as
+            // it was sent (1.4.0-beta.13); waiting there counts as exposed.
+            enqueueExposures: { [weak self] body in self?.enqueueFlagExposures(body) },
+            pendingExposures: { [weak self] in self?.exposureOutbox?.snapshot().map(\.body) ?? [] }
         ))
         // Not workspace-scoped: another SDK key in this app may have written it.
         storage.setValue(nil, forKey: FlagsManager.legacyStorageKey)
@@ -832,18 +851,22 @@ public class Joryio {
         // "a previous user's" without the app ever being asked for their
         // token. Nothing but withdrawals is sent while such a user is kept.
         network.currentUserId = { [weak self] in self?.identity.withdrawalUserId() }
-        outbox.permits = { [weak self] entry in
-            guard let self else { return false }
-            // Withdrawals - the opt-out record, an unsubscribe, a push
-            // unregister - are delivered whatever the opt-out or the consent
-            // (contract v4, 36). Everything else waits for both.
-            if !entry.isCollection { return self.isInitialized }
-            return self.canSend
+        // The same rules on both outboxes: the exposures one is the main one's
+        // sibling, apart only on disk.
+        for box in [outbox!, exposureOutbox!] {
+            box.permits = { [weak self] entry in
+                guard let self else { return false }
+                // Withdrawals - the opt-out record, an unsubscribe, a push
+                // unregister - are delivered whatever the opt-out or the consent
+                // (contract v4, 36). Everything else waits for both.
+                if !entry.isCollection { return self.isInitialized }
+                return self.canSend
+            }
+            box.currentUserId = { [weak self] in self?.identity.withdrawalUserId() }
+            box.resolve = { [weak self] entry in self?.resolveIds(of: entry) ?? entry }
+            box.flushEvents = { [weak self] in await self?.queue.flush(force: true) }
+            box.onSettled = { [weak self] entry, stored in self?.outboxEntrySettled(entry, stored: stored) }
         }
-        outbox.currentUserId = { [weak self] in self?.identity.withdrawalUserId() }
-        outbox.resolve = { [weak self] entry in self?.resolveIds(of: entry) ?? entry }
-        outbox.flushEvents = { [weak self] in await self?.queue.flush(force: true) }
-        outbox.onSettled = { [weak self] entry, stored in self?.outboxEntrySettled(entry, stored: stored) }
         inAppMessaging.canSync = { [weak self] in self?.canSend ?? false }
         pushNotifications.canRegister = { [weak self] in self?.canSend ?? false }
         pushNotifications.canReport = { [weak self] in self?.canSend ?? false }
@@ -978,6 +1001,7 @@ public class Joryio {
         // Writes left over from the last run - identify, aliases, subscription
         // changes, the opt-out record, push unregisters - go out now.
         outbox.kick()
+        exposureOutbox.kick()
         pushNotifications.retryPendingUnregisters()
 
         // Sync in-app campaigns for this SESSION START. willEnterForeground
@@ -1011,6 +1035,8 @@ public class Joryio {
 
     /// Where the write outbox is persisted (StorageManager key-value table).
     static let outboxStorageKey = "write_outbox"
+    /// Where `exposureOutbox` is persisted - never inside `write_outbox`.
+    static let flagExposuresOutboxStorageKey = "flag_exposures_outbox"
     /// The last placement answers, per person (PlacementManager.swift) and per
     /// workspace: the key carries the SDK key like the flags cache
     /// (FlagsManager.storageKey), because the kv table is one database per app.
@@ -1459,10 +1485,36 @@ public class Joryio {
             storage.setOptOutMarkerAcked(value)
             // The opt-out may have changed again while this was in flight.
             syncOptOutMarker()
+        case .flagExposures:
+            // Taken, or refused for good: never sent again, so its marks are stored.
+            flagsManager?.exposuresSettled(entry.body)
         case .alias, .subscription, .pushUnregister, .attributes:
             break
         }
         pruneRetiredTokens()
+    }
+
+    /// A flag exposures batch the server did not take: into the outbox as it
+    /// was sent. At most FLAG_EXPOSURE_MARKS_MAX exposures wait there (the
+    /// oldest batch goes first), so exposures never crowd out the profile writes.
+    private func enqueueFlagExposures(_ body: String) {
+        guard let outbox = exposureOutbox else { return }
+        let incoming = exposureMarks(body).count
+        while true {
+            let waiting = outbox.snapshot()
+            guard let oldest = waiting.first,
+                  waiting.reduce(0, { $0 + exposureMarks($1.body).count }) + incoming > JoryioFlags.FLAG_EXPOSURE_MARKS_MAX else { break }
+            outbox.removeAll { $0.id == oldest.id }
+        }
+        let ids = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any]
+        outbox.add(OutboxEntry(
+            kind: .flagExposures,
+            path: "/v1/flags/exposures",
+            body: body,
+            userId: ids?["userId"] as? String,
+            anonymousId: ids?["anonymousId"] as? String
+        ))
+        outbox.kick()
     }
 
     /// Users with a withdrawal still queued - an unsubscribe, the opt-out
@@ -1489,7 +1541,7 @@ public class Joryio {
         let users = authStore.retiredUserIds
         guard !users.isEmpty else { return }
         let pushEntries = pushNotifications?.unregisterOutbox.snapshot() ?? []
-        let outboxUsers = Set((outbox.snapshot() + pushEntries).compactMap(\.userId))
+        let outboxUsers = Set((outbox.snapshot() + exposureOutbox.snapshot() + pushEntries).compactMap(\.userId))
         // The user requests are made for now - identified, or held while
         // tracking is off (D-b) - keeps a token filed under them: a held
         // user's withdrawals carry it (SDK contract v7, 72).
@@ -1545,6 +1597,7 @@ public class Joryio {
     /// resumes.
     private func retryOwedRequests(force: Bool = false) {
         outbox.kick(force: force)
+        exposureOutbox.kick(force: force)
         pushNotifications.retryPendingUnregisters(force: force)
     }
 
@@ -2019,6 +2072,8 @@ public class Joryio {
         storage?.clearReportedPushPermission()
         queue?.clearQueue()
         outbox?.removeAll { $0.isCollection }
+        // Flag exposures are collection only: all of them go, on disk too.
+        exposureOutbox?.removeAll { _ in true }
         locked { _heldLinkTokens.removeAll() }
         if owesSessionStart { markSessionStartOwed() }
     }
@@ -2265,6 +2320,7 @@ public class Joryio {
             // The opt-out record may have waited for consent.
             syncOptOutMarker()
             outbox.kick(force: true)
+            exposureOutbox.kick(force: true)
             guard canSend else { return }
             releaseOwedSessionStart()
             resumeSending()

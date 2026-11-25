@@ -243,6 +243,23 @@ class NetworkClient: PlacementTransport, CardTransport {
         }
     }
 
+    /// A flag exposures batch (FlagsManager.swift): POST once, the same transport
+    /// as `postFlags`. Answers the HTTP status (0 = no answer) and Retry-After,
+    /// so the FlagsManager can tell a batch the server took (or refused for
+    /// good) from one to send again with the same `idempotencyKey`.
+    func postFlagExposures(body: Data) async -> FlagsPostStatus {
+        let endpoint = "\(apiEndpoint)/v1/flags/exposures"
+        let userId = Self.subjectUserId(of: body)
+        do {
+            let (status, _, http, _) = try await performRawWithAuth(endpoint: endpoint, body: body, requestUserId: userId)
+            if (200...299).contains(status) { onTransportSuccess?() } else { onTransportFailure?(NetworkError.httpError(status)) }
+            return FlagsPostStatus(status: status, retryAfter: Self.parseRetryAfter(http.value(forHTTPHeaderField: "Retry-After")))
+        } catch {
+            logger.debug("Flag exposures request failed: \(error.localizedDescription)")
+            return FlagsPostStatus(status: 0)
+        }
+    }
+
     /// Pure classification of a durable write's answer (unit-testable).
     static func classifyWriteResponse(status: Int, body: Data, retryAfterHeader: String?) -> WriteOutcome {
         switch status {
