@@ -1,7 +1,7 @@
 import Foundation
 
 /// Network client for API communication
-class NetworkClient {
+class NetworkClient: PlacementTransport, CardTransport {
     private let sdkKey: String
     private let apiEndpoint: String
     private let logger: Logger
@@ -222,6 +222,44 @@ class NetworkClient {
         }
     }
 
+    /// Feature flags (FlagsManager.swift): POST `path` ONCE - no retries, the
+    /// held answer stays in use until the next refresh. The SDK-authentication
+    /// token follows the body's `userId`, and a refused token asks the app for
+    /// a fresh one, like every other request. Nil = no usable answer.
+    func postFlags(path: String, body: Data) async -> [String: Any]? {
+        let endpoint = "\(apiEndpoint)\(path)"
+        let userId = Self.subjectUserId(of: body)
+        do {
+            let (status, data, _, _) = try await performRawWithAuth(endpoint: endpoint, body: body, requestUserId: userId)
+            guard (200...299).contains(status) else {
+                onTransportFailure?(NetworkError.httpError(status))
+                return nil
+            }
+            onTransportSuccess?()
+            return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        } catch {
+            logger.debug("Flags request failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// A flag exposures batch (FlagsManager.swift): POST once, the same transport
+    /// as `postFlags`. Answers the HTTP status (0 = no answer) and Retry-After,
+    /// so the FlagsManager can tell a batch the server took (or refused for
+    /// good) from one to send again with the same `idempotencyKey`.
+    func postFlagExposures(body: Data) async -> FlagsPostStatus {
+        let endpoint = "\(apiEndpoint)/v1/flags/exposures"
+        let userId = Self.subjectUserId(of: body)
+        do {
+            let (status, _, http, _) = try await performRawWithAuth(endpoint: endpoint, body: body, requestUserId: userId)
+            if (200...299).contains(status) { onTransportSuccess?() } else { onTransportFailure?(NetworkError.httpError(status)) }
+            return FlagsPostStatus(status: status, retryAfter: Self.parseRetryAfter(http.value(forHTTPHeaderField: "Retry-After")))
+        } catch {
+            logger.debug("Flag exposures request failed: \(error.localizedDescription)")
+            return FlagsPostStatus(status: 0)
+        }
+    }
+
     /// Pure classification of a durable write's answer (unit-testable).
     static func classifyWriteResponse(status: Int, body: Data, retryAfterHeader: String?) -> WriteOutcome {
         switch status {
@@ -309,6 +347,7 @@ class NetworkClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(sdkKey, forHTTPHeaderField: "Authorization")
         request.setValue(sdkKey, forHTTPHeaderField: "X-App-Key")
+        SdkIdentity.apply(to: &request)
         if let authToken = authToken(routing: body, subject: subject) {
             request.setValue(authToken, forHTTPHeaderField: "X-Joryio-Auth")
         }
@@ -326,6 +365,15 @@ class NetworkClient {
         let endpoint = "\(apiEndpoint)/v1/identify"
         try await sendRequest(endpoint: endpoint, method: "POST", body: request)
         logger.debug("User identified: \(maskIdentifier(request.userId))")
+    }
+
+    /// Click-link identity (`/v1/identify-link`): the same endpoint, headers
+    /// and SDK-key auth as identify. A 4xx is final; a 5xx or a transport
+    /// error gets the normal retry. The token is never logged.
+    func identifyLink(_ request: IdentifyLinkRequest) async throws {
+        let endpoint = "\(apiEndpoint)\(ClickIdentity.identifyLinkPath)"
+        try await sendRequest(endpoint: endpoint, method: "POST", body: request)
+        logger.debug("Click-link identity sent")
     }
 
     /// A labelled alias (`/v1/alias/add`). Works for an anonymous visitor too:
@@ -374,6 +422,48 @@ class NetworkClient {
         )
         logger.debug("In-app campaigns synced: \(response.campaigns.count) campaigns")
         return response
+    }
+
+    // MARK: - Placements (docs/PLACEMENTS_PLAN.md 3.5)
+
+    /// POST /v1/in-app/placements ONCE - no retries: an answer is only useful
+    /// now, and a 429 (the per-device limit) means "keep your cache".
+    func fetchPlacements(_ body: Data) async -> (Int, Data?) {
+        let endpoint = "\(apiEndpoint)/v1/in-app/placements"
+        do {
+            let (status, data, _, _) = try await performRawWithAuth(endpoint: endpoint, body: body, requestUserId: nil)
+            return (status, (200...299).contains(status) ? data : nil)
+        } catch {
+            logger.debug("Placements request failed: \(error.localizedDescription)")
+            return (0, nil)
+        }
+    }
+
+    /// A placement interaction or holdout exposure to /v1/in-app/track (one attempt; the server dedups per delivery).
+    func trackPlacement(_ body: Data) async {
+        let endpoint = "\(apiEndpoint)/v1/in-app/track"
+        _ = try? await performRawWithAuth(endpoint: endpoint, body: body, requestUserId: nil)
+    }
+
+    // MARK: - Content cards (docs/PLACEMENTS_PLAN.md 11.3)
+
+    /// POST /v1/in-app/cards ONCE - no retries, like placements: a 429 (the
+    /// per-device limit) or a failure means "keep your cached feed".
+    func fetchCards(_ body: Data) async -> (Int, Data?) {
+        let endpoint = "\(apiEndpoint)/v1/in-app/cards"
+        do {
+            let (status, data, _, _) = try await performRawWithAuth(endpoint: endpoint, body: body, requestUserId: nil)
+            return (status, (200...299).contains(status) ? data : nil)
+        } catch {
+            logger.debug("Card feed request failed: \(error.localizedDescription)")
+            return (0, nil)
+        }
+    }
+
+    /// A card report to /v1/in-app/track (one attempt; the server records each action once per card).
+    func trackCard(_ body: Data) async {
+        let endpoint = "\(apiEndpoint)/v1/in-app/track"
+        _ = try? await performRawWithAuth(endpoint: endpoint, body: body, requestUserId: nil)
     }
 
     func trackImpression(_ request: TrackImpressionRequest) async throws {
@@ -465,6 +555,7 @@ class NetworkClient {
         guard let url = URL(string: endpoint) else { throw NetworkError.invalidURL }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        SdkIdentity.apply(to: &request)
         _ = try await session.data(for: request)
         logger.debug("Push delivery receipt sent")
     }
@@ -479,6 +570,7 @@ class NetworkClient {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        SdkIdentity.apply(to: &request)
         // Carry the SDK-auth JWT on this beacon too when enabled - routed by
         // `sub` like every other request (SDK contract v7 72, v8 82): the
         // signed-in user's own token, never one set for someone else before
@@ -687,6 +779,7 @@ class NetworkClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(sdkKey, forHTTPHeaderField: "Authorization")
         request.setValue(sdkKey, forHTTPHeaderField: "X-App-Key")
+        SdkIdentity.apply(to: &request)
 
         let encoder = WireJSON.encoder()
         let encoded = try encoder.encode(body)

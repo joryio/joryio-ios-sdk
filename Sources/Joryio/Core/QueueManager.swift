@@ -80,9 +80,25 @@ class QueueManager {
     /// user has nothing queued any more (owner decision D-a).
     var afterFlush: () -> Void = {}
 
+    /// Bumped by every `clearQueue()` (an opt-out, a denial, a wipe), under
+    /// `clearLock`. The SDK reads it when an event is TRACKED and passes it
+    /// to `enqueue(_:generation:)`, so an event tracked before a clear but
+    /// inserted after it is still discarded; and a flush reads it before it
+    /// takes rows, so rows taken before a clear never go out in a request
+    /// that starts after it. The same rule as Android and web.
+    private let clearLock = NSLock()
+    private var _generation = 0
+    var generation: Int {
+        clearLock.lock()
+        defer { clearLock.unlock() }
+        return _generation
+    }
+
     private var flushTimer: Timer?
     private let flushLock = NSLock()
     private var isFlushingQueue = false
+    /// Waiting for the flush in flight to end (flushAfterInFlight).
+    private var flushWaiters: [CheckedContinuation<Void, Never>] = []
 
     // Backoff + suspension state, under `flushLock`.
     private var consecutiveFailures = 0
@@ -132,9 +148,27 @@ class QueueManager {
 
     // MARK: - Queue Management
 
-    func enqueue(_ event: Event) {
+    /// - Parameter generation: `generation` as read when the event was
+    ///   tracked. A clear since then discards the event: the opt-out covers
+    ///   it, even though its insert runs after. Nil = now.
+    func enqueue(_ event: Event, generation: Int? = nil) {
         do {
-            try storage.enqueueEvent(event)
+            // The check and the insert are one step against clearQueue():
+            // checked first and inserted after a clear, the event survived
+            // the opt-out and went out with the next optIn().
+            clearLock.lock()
+            if let generation, generation != _generation {
+                clearLock.unlock()
+                logger.debug("Event \(event.type) discarded: tracked before the queue was cleared")
+                return
+            }
+            do {
+                try storage.enqueueEvent(event)
+            } catch {
+                clearLock.unlock()
+                throw error
+            }
+            clearLock.unlock()
             logger.debug("Event queued: \(event.type)")
 
             // The cap, oldest first. Exactly the overflow - this used to drop a
@@ -184,8 +218,13 @@ class QueueManager {
         }
 
         defer {
-            withFlushLock { isFlushingQueue = false }
+            let waiters: [CheckedContinuation<Void, Never>] = withFlushLock {
+                isFlushingQueue = false
+                defer { flushWaiters.removeAll() }
+                return flushWaiters
+            }
             afterFlush()
+            waiters.forEach { $0.resume() }
         }
 
         guard canSend() else {
@@ -195,10 +234,12 @@ class QueueManager {
 
         do {
             while true {
+                // Read BEFORE the rows are taken: rows taken under one
+                // generation are never sent under the next.
+                let readAt = generation
                 let rows = Self.oneUserOnly(Self.limitByBytes(try storage.dequeueQueuedEvents(limit: batchSize)))
                 if rows.isEmpty { break }
-                guard canSend() else { break }
-                guard await send(rows) else { break }
+                guard await send(rows, readAt: readAt) else { break }
             }
         } catch {
             logger.error("Failed to flush queue: \(error.localizedDescription)")
@@ -241,7 +282,16 @@ class QueueManager {
 
     /// Send `rows`, act on the answer. Returns whether the flush may go on to
     /// the next batch.
-    private func send(_ rows: [StorageManager.QueuedEvent]) async -> Bool {
+    ///
+    /// - Parameter readAt: `generation` as read before the rows were taken.
+    private func send(_ rows: [StorageManager.QueuedEvent], readAt: Int) async -> Bool {
+        // An optOut() (or a denial) since the rows were taken discards them,
+        // and no request may start with them after it - also when optIn()
+        // followed at once, which makes canSend() true again. Checked right
+        // before each request, the halves of a bisected batch included: an
+        // event tracked before optOut() goes out only in a request that had
+        // already started when optOut() was called.
+        guard canSend(), generation == readAt else { return false }
         let outcome = await sender.sendEventBatch(rows.map(\.json), userId: rows.first.flatMap(Self.userId(of:)))
 
         switch outcome {
@@ -277,8 +327,8 @@ class QueueManager {
             }
             // Bisect, so the events that ARE valid still get through.
             let mid = rows.count / 2
-            guard await send(Array(rows[..<mid])) else { return false }
-            return await send(Array(rows[mid...]))
+            guard await send(Array(rows[..<mid]), readAt: readAt) else { return false }
+            return await send(Array(rows[mid...]), readAt: readAt)
 
         case .authFailed(let reason):
             // ANY SDK-authentication reason (v4 39): an `expired` or `invalid`
@@ -378,6 +428,36 @@ class QueueManager {
     /// False only in tests, which run without a UIApplication.
     var usesBackgroundTask = true
 
+    /// Wait for a flush in flight (if any) to end, then flush - so an event
+    /// queued while that flush was already reading the queue is sent too.
+    func flushAfterInFlight() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            let waiting: Bool = withFlushLock {
+                guard isFlushingQueue else { return false }
+                flushWaiters.append(cont)
+                return true
+            }
+            if !waiting { cont.resume() }
+        }
+        await flush()
+    }
+
+    /**
+     A "Show when" re-check (D465) must not reach the server before its event:
+     true once the event (its client `eventId`) has left the queue - sent by
+     the flush in flight or by one more. False when it is still queued (a
+     failure, a backoff, no consent): the caller waits for the next flush.
+     */
+    func deliver(eventId: String) async -> Bool {
+        for _ in 0..<3 {
+            if !isQueued(eventId: eventId) { return true }
+            await flushAfterInFlight()
+        }
+        return !isQueued(eventId: eventId)
+    }
+
+    func isQueued(eventId: String) -> Bool { storage.hasQueuedEvent(eventId: eventId) }
+
     func flushSync(force: Bool = false) {
         guard usesBackgroundTask else {
             Task { await self.flush(force: force) }
@@ -447,6 +527,9 @@ class QueueManager {
     }
 
     func clearQueue() {
+        clearLock.lock()
+        defer { clearLock.unlock() }
+        _generation += 1
         do {
             try storage.clearQueue()
             logger.info("Event queue cleared")

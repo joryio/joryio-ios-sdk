@@ -35,6 +35,7 @@ class StorageManager {
     private let sessionKey: String
     private let attributesKey: String
     private let deviceIdKey: String
+    private let signedInAnonymousIdsKey: String
 
     /// Overrides where the SQLite file lives. Tests only: production always
     /// uses Application Support/Joryio.
@@ -63,6 +64,7 @@ class StorageManager {
         self.sessionKey = "\(prefix)_session"
         self.attributesKey = "\(prefix)_attributes"
         self.deviceIdKey = "\(prefix)_device_id"
+        self.signedInAnonymousIdsKey = "\(prefix)_signed_in_anonymous_ids"
 
         initializeDatabase()
 
@@ -603,6 +605,24 @@ class StorageManager {
         _ = keychain.setString("", forKey: kcPendingAttributesAccount)
     }
 
+    // MARK: - Anonymous ids tied to a signed-in user (BACKLOG D366)
+    //
+    // The anonymous id a reset signed a user out of: tied to their profile,
+    // so resetTo refuses it. Newest `ResetTo.signedInAnonymousIdsMax` kept;
+    // clearAllData (wipeData) forgets them.
+
+    func getSignedInAnonymousIds() -> [String] {
+        (userDefaults.array(forKey: signedInAnonymousIdsKey) as? [String]) ?? []
+    }
+
+    func rememberSignedInAnonymousId(_ id: String) {
+        userDefaults.set(ResetTo.remember(getSignedInAnonymousIds(), id), forKey: signedInAnonymousIdsKey)
+    }
+
+    func clearSignedInAnonymousIds() {
+        userDefaults.removeObject(forKey: signedInAnonymousIdsKey)
+    }
+
     // MARK: - Held user id (owner decision D-b, 2026-10-07)
     //
     // identify() made while consent is denied or the person opted out: no
@@ -660,6 +680,26 @@ class StorageManager {
         fragment = String(fragment.dropFirst().dropLast()) // ["x"] -> "x"
         let needle = "\"userId\":" + fragment
         let escaped = needle
+            .replacingOccurrences(of: "!", with: "!!")
+            .replacingOccurrences(of: "%", with: "!%")
+            .replacingOccurrences(of: "_", with: "!_")
+        return dbQueue.sync {
+            guard let db = openDatabaseLocked() else { return true }
+            let events = Table("events")
+            let eventData = Expression<String>("event_data")
+            let count = (try? db.scalar(events.filter(eventData.like("%\(escaped)%", escape: "!")).count)) ?? 1
+            return count > 0
+        }
+    }
+
+    /// Is this event (its client `eventId`) still in the queue - not sent yet?
+    /// An error answers true: a "Show when" re-check then waits for the next flush
+    /// instead of reaching the server before its event.
+    func hasQueuedEvent(eventId: String) -> Bool {
+        guard let encodedId = try? JSONEncoder().encode([eventId]),
+              var fragment = String(data: encodedId, encoding: .utf8) else { return true }
+        fragment = String(fragment.dropFirst().dropLast())
+        let escaped = ("\"eventId\":" + fragment)
             .replacingOccurrences(of: "!", with: "!!")
             .replacingOccurrences(of: "%", with: "!%")
             .replacingOccurrences(of: "_", with: "!_")
@@ -949,6 +989,7 @@ class StorageManager {
         userDefaults.removeObject(forKey: userIdKey)
         userDefaults.removeObject(forKey: sessionKey)
         userDefaults.removeObject(forKey: attributesKey)
+        userDefaults.removeObject(forKey: signedInAnonymousIdsKey)
 
         // Clear Keychain-stored secrets (userId + APNs device token)
         keychain.removeItem(forKey: kcUserIdAccount)

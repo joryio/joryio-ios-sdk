@@ -41,10 +41,16 @@ public class Joryio {
     private var network: NetworkClient!
     private var queue: QueueManager!
     private var inAppMessaging: InAppMessagingManager!
+    /// Placements: spots inside the app filled per person (PlacementManager.swift).
+    private var placementManager: PlacementManager!
+    /// Content cards: the person's feed (CardManager.swift).
+    private var cardManager: CardManager!
     private var pushNotifications: PushNotificationManager!
     /// Thread-safe holder for the optional SDK-authentication token + handler.
     /// Created at initialize() from config; shared with NetworkClient.
     private var authStore: SdkAuthTokenStore!
+    /// Feature flags + remote config (FlagsManager.swift, BACKLOG D446).
+    private var flagsManager: FlagsManager?
 
     /// Coalescing window for attribute writes; see scheduleAttributeFlush().
     private static let attributeFlushDebounceMs: UInt64 = 800
@@ -83,6 +89,12 @@ public class Joryio {
     /// id: it is announced by the next event, or the next foreground,
     /// exactly as a timed-out session is (SDK contract v6, 66).
     private var _sessionStartDue = false
+    /// Click-link tokens (`jr_t`) this process has accepted - sent or held -
+    /// so the same link handed in twice is sent once. Memory only.
+    private var _acceptedLinkTokens = Set<String>()
+    /// Click-link tokens held while consent is pending: memory only, never
+    /// on disk; sent on `.granted`, dropped on a denial, an opt-out, reset().
+    private var _heldLinkTokens: [String] = []
     /// initialize() refused the key or the host. Calls that answer through
     /// a callback then answer at once instead of waiting for a start that
     /// will not come (contract v4, 48).
@@ -93,6 +105,12 @@ public class Joryio {
     /// identify, addAlias, subscription changes and the opt-out record,
     /// persisted until the server acknowledges them (SDK contract 28).
     private var outbox: WriteOutbox!
+    /// Flag exposure batches the server did not take (1.4.0-beta.13): a
+    /// sibling of `outbox` with the same rules (retry, backoff, identity,
+    /// purge), stored under its OWN key. An SDK before 1.4.0-beta.13 never
+    /// reads that key, so a rollback keeps its write outbox decodable - one
+    /// list holding an entry kind it does not know would be discarded whole.
+    private var exposureOutbox: WriteOutbox!
 
     private func locked<T>(_ body: () -> T) -> T {
         stateLock.lock()
@@ -215,7 +233,10 @@ public class Joryio {
     /// wipeData() or consent denied made before init removes it. unregisterPush,
     /// flush, reset and push-token registration are not collection and stay
     /// (scan 3, M3) - an opt-out used to discard an unregisterPush() too.
-    private var preInitCalls: [(call: (Joryio) -> Void, purgeable: Bool, settle: (() -> Void)?)] = []
+    /// `dropped`: answers a caller-visible callback when the call is
+    /// discarded before it runs (resetTo: `false`), so an awaiting host never
+    /// hangs. Called outside the lock.
+    private var preInitCalls: [(call: (Joryio) -> Void, purgeable: Bool, settle: (() -> Void)?, dropped: (() -> Void)?)] = []
     /// True once the buffer has been replayed. Until then a call is buffered
     /// even while initialize() is running, so it cannot overtake older ones.
     private var preInitDrained = false
@@ -254,6 +275,7 @@ public class Joryio {
         purgeable: Bool = true,
         keptWhileRefused: Bool = false,
         settle: (() -> Void)? = nil,
+        dropped onDropped: (() -> Void)? = nil,
         method: String = #function
     ) -> Bool {
         bufferLock.lock()
@@ -276,21 +298,24 @@ public class Joryio {
             } else {
                 print("[Joryio] \(method) called before initialize() while tracking is opted out or consent is denied: dropped.")
             }
+            onDropped?()
             return false
         }
         var dropped = false
+        var evicted: (() -> Void)?
         if preInitCalls.count >= Self.maxPreInitCalls {
             // The oldest call that COLLECTS goes first; a withdrawal, an
             // unregisterPush(), reset() or flush() only when nothing else is
             // left (SDK contract v5, 51). A burst of track() calls used to
             // push out an unsubscribe made before them.
             let index = preInitCalls.firstIndex(where: { $0.purgeable }) ?? 0
-            preInitCalls.remove(at: index)
+            evicted = preInitCalls.remove(at: index).dropped
             if index < preWipeCallCount { preWipeCallCount -= 1 }
             dropped = true
         }
-        preInitCalls.append((call, purgeable, settle))
+        preInitCalls.append((call, purgeable, settle, onDropped))
         bufferLock.unlock()
+        evicted?()
         if dropped {
             print("[Joryio] More than \(Self.maxPreInitCalls) calls were made before initialize(); dropped the oldest data call.")
         }
@@ -345,9 +370,11 @@ public class Joryio {
     /// Drop the buffered calls that collect (see `preInitCalls`).
     private func purgeCollectingPreInitCalls(markingWipe: Bool = false) {
         bufferLock.lock()
+        let dropped = preInitCalls.filter(\.purgeable).compactMap(\.dropped)
         preInitCalls.removeAll { $0.purgeable }
         if markingWipe { preWipeCallCount = preInitCalls.count }
         bufferLock.unlock()
+        dropped.forEach { $0() }
     }
 
     /// Run the calls made before a pre-init wipeData(), under the identity
@@ -593,6 +620,8 @@ public class Joryio {
         self.config = config ?? JoryioConfig()
 
         self.logger = Logger(enabled: self.config.enableDebug, logLevel: self.config.logLevel)
+        LinkRouter.logger = logger
+        LinkRouter.forwardUniversalLinks = self.config.forwardUniversalLinks
         logger.info("Initializing Joryio SDK v\(SDK_VERSION)")
         logger.debug("SDK Key: \(sdkKey)")
         logger.debug("API Endpoint: \(self.apiEndpoint ?? "unknown")")
@@ -692,6 +721,14 @@ public class Joryio {
                 await network?.sendWrite(path: path, body: body, userId: userId) ?? .retry(retryAfter: nil, answered: false)
             }
         )
+        self.exposureOutbox = WriteOutbox(
+            logger: logger,
+            load: { [weak storage = self.storage] in storage?.readValue(forKey: Self.flagExposuresOutboxStorageKey) ?? .unavailable },
+            save: { [weak storage = self.storage] in storage?.setValue($0, forKey: Self.flagExposuresOutboxStorageKey) },
+            sender: { [weak network = self.network] path, body, userId in
+                await network?.sendWrite(path: path, body: body, userId: userId) ?? .retry(retryAfter: nil, answered: false)
+            }
+        )
         let inAppConfig = self.config.inApp
         self.inAppMessaging = InAppMessagingManager(
             networkClient: network,
@@ -709,6 +746,38 @@ public class Joryio {
             ),
             holdInAppMessagesForHandler: inAppConfig.holdInAppMessagesForHandler
         )
+        let placementHtml = inAppConfig.allowHtmlJsInAppMessages
+        self.placementManager = PlacementManager(
+            transport: network,
+            load: { [weak storage = self.storage] in storage?.getValue(forKey: Self.placementsStorageKey(sdkKey: sdkKey)) },
+            save: { [weak storage = self.storage] in storage?.setValue($0, forKey: Self.placementsStorageKey(sdkKey: sdkKey)) },
+            consent: { [weak self] in self?.placementConsent() },
+            userId: { [weak identity = self.identity] in identity?.getUserId() },
+            anonymousId: { [weak identity = self.identity] in identity?.getAnonymousId() ?? "" },
+            sessionId: { [weak session = self.session] in session?.getSessionId() },
+            capabilities: {
+                placementHtml
+                    ? ["placements", "content.native", "content.data", "content.html"]
+                    : ["placements", "content.native", "content.data"]
+            },
+            // "Show when" (D465): `seconds` counts on the time_on_screen clock;
+            // an event re-check goes only after its event has left the queue.
+            screenClock: inAppMessaging.screenClock,
+            deliverEvent: { [weak self] id in await self?.queue?.deliver(eventId: id) ?? false },
+            isEventQueued: { [weak self] id in self?.queue?.isQueued(eventId: id) ?? true }
+        )
+        self.cardManager = CardManager(
+            transport: network,
+            loadFeed: { [weak storage = self.storage] in storage?.getValue(forKey: Self.cardsStorageKey(sdkKey: sdkKey)) },
+            saveFeed: { [weak storage = self.storage] in storage?.setValue($0, forKey: Self.cardsStorageKey(sdkKey: sdkKey)) },
+            loadDevice: { [weak storage = self.storage] in storage?.getValue(forKey: Self.cardsDeviceStateStorageKey(sdkKey: sdkKey)) },
+            saveDevice: { [weak storage = self.storage] in storage?.setValue($0, forKey: Self.cardsDeviceStateStorageKey(sdkKey: sdkKey)) },
+            consent: { [weak self] in self?.placementConsent() },
+            userId: { [weak identity = self.identity] in identity?.getUserId() },
+            anonymousId: { [weak identity = self.identity] in identity?.getAnonymousId() ?? "" },
+            sessionId: { [weak session = self.session] in session?.getSessionId() },
+            capabilities: { [Cards.capability, "content.native"] }
+        )
         self.pushNotifications = PushNotificationManager(
             networkClient: network,
             identityManager: identity,
@@ -716,6 +785,29 @@ public class Joryio {
             logger: logger,
             inAppMessaging: inAppMessaging
         )
+        self.flagsManager = FlagsManager(FlagsManager.Dependencies(
+            post: { [weak network = self.network] path, body in await network?.postFlags(path: path, body: body) },
+            canSend: { [weak self] in self?.canSend ?? false },
+            userId: { [weak identity = self.identity] in identity?.getUserId() },
+            anonymousId: { [weak identity = self.identity] in identity?.getAnonymousId() ?? "" },
+            sessionId: { [weak session = self.session] in session?.getSessionId() ?? "" },
+            attributes: { [weak identity = self.identity] in identity?.getUserAttributes() ?? [:] },
+            context: { Self.flagsContext() },
+            load: { [weak storage = self.storage] in storage?.getValue(forKey: FlagsManager.storageKey(sdkKey: sdkKey)) },
+            save: { [weak storage = self.storage] in storage?.setValue($0, forKey: FlagsManager.storageKey(sdkKey: sdkKey)) },
+            loadExposures: { [weak storage = self.storage] in storage?.getValue(forKey: FlagsManager.exposuresStorageKey(sdkKey: sdkKey)) },
+            saveExposures: { [weak storage = self.storage] in storage?.setValue($0, forKey: FlagsManager.exposuresStorageKey(sdkKey: sdkKey)) },
+            postExposures: { [weak network = self.network] body in await network?.postFlagExposures(body: body) ?? FlagsPostStatus(status: 0) },
+            // A batch the server did not take goes to the persisted outbox, as
+            // it was sent (1.4.0-beta.13); waiting there counts as exposed.
+            enqueueExposures: { [weak self] body, retryAfter in self?.enqueueFlagExposures(body, retryAfter: retryAfter) },
+            pendingExposures: { [weak self] in self?.exposureOutbox?.snapshot().map(\.body) ?? [] }
+        ))
+        // Not workspace-scoped: another SDK key in this app may have written it.
+        storage.setValue(nil, forKey: FlagsManager.legacyStorageKey)
+        storage.setValue(nil, forKey: Self.legacyPlacementsStorageKey)
+        storage.setValue(nil, forKey: Self.legacyCardsStorageKey)
+        storage.setValue(nil, forKey: Self.legacyCardsDeviceStateStorageKey)
 
         // Route transport outcomes to `lastTransportError`. Set BEFORE any
         // task can use the network (scan 5, N2): they used to be assigned
@@ -747,7 +839,11 @@ public class Joryio {
 
         // One gate, asked by every outbound path (SDK contracts 4 and 5).
         queue.canSend = { [weak self] in self?.canSend ?? false }
-        queue.afterFlush = { [weak self] in self?.pruneRetiredTokens() }
+        queue.afterFlush = { [weak self] in
+            self?.pruneRetiredTokens()
+            // "Show when" re-checks whose event a failed flush had kept (D465).
+            self?.placementManager?.onEventsFlushed()
+        }
         queue.currentUserId = { [weak self] in self?.identity.getUserId() }
         // For SDK authentication the "current" user is the one a withdrawal is
         // sent for (SDK contract v6, 63): a user kept while tracking is off
@@ -755,18 +851,22 @@ public class Joryio {
         // "a previous user's" without the app ever being asked for their
         // token. Nothing but withdrawals is sent while such a user is kept.
         network.currentUserId = { [weak self] in self?.identity.withdrawalUserId() }
-        outbox.permits = { [weak self] entry in
-            guard let self else { return false }
-            // Withdrawals - the opt-out record, an unsubscribe, a push
-            // unregister - are delivered whatever the opt-out or the consent
-            // (contract v4, 36). Everything else waits for both.
-            if !entry.isCollection { return self.isInitialized }
-            return self.canSend
+        // The same rules on both outboxes: the exposures one is the main one's
+        // sibling, apart only on disk.
+        for box in [outbox!, exposureOutbox!] {
+            box.permits = { [weak self] entry in
+                guard let self else { return false }
+                // Withdrawals - the opt-out record, an unsubscribe, a push
+                // unregister - are delivered whatever the opt-out or the consent
+                // (contract v4, 36). Everything else waits for both.
+                if !entry.isCollection { return self.isInitialized }
+                return self.canSend
+            }
+            box.currentUserId = { [weak self] in self?.identity.withdrawalUserId() }
+            box.resolve = { [weak self] entry in self?.resolveIds(of: entry) ?? entry }
+            box.flushEvents = { [weak self] in await self?.queue.flush(force: true) }
+            box.onSettled = { [weak self] entry, stored in self?.outboxEntrySettled(entry, stored: stored) }
         }
-        outbox.currentUserId = { [weak self] in self?.identity.withdrawalUserId() }
-        outbox.resolve = { [weak self] entry in self?.resolveIds(of: entry) ?? entry }
-        outbox.flushEvents = { [weak self] in await self?.queue.flush(force: true) }
-        outbox.onSettled = { [weak self] entry, stored in self?.outboxEntrySettled(entry, stored: stored) }
         inAppMessaging.canSync = { [weak self] in self?.canSend ?? false }
         pushNotifications.canRegister = { [weak self] in self?.canSend ?? false }
         pushNotifications.canReport = { [weak self] in self?.canSend ?? false }
@@ -901,6 +1001,7 @@ public class Joryio {
         // Writes left over from the last run - identify, aliases, subscription
         // changes, the opt-out record, push unregisters - go out now.
         outbox.kick()
+        exposureOutbox.kick()
         pushNotifications.retryPendingUnregisters()
 
         // Sync in-app campaigns for this SESSION START. willEnterForeground
@@ -909,6 +1010,10 @@ public class Joryio {
         Task { [weak self] in
             await self?.inAppMessaging.syncCampaigns()
         }
+
+        // Flags: the stored answer is readable at once; refreshed now (only
+        // on a device whose app reads flags - nothing is fetched before).
+        flagsManager?.start()
 
         logger.info("SDK initialized successfully")
 
@@ -930,6 +1035,23 @@ public class Joryio {
 
     /// Where the write outbox is persisted (StorageManager key-value table).
     static let outboxStorageKey = "write_outbox"
+    /// Where `exposureOutbox` is persisted - never inside `write_outbox`.
+    static let flagExposuresOutboxStorageKey = "flag_exposures_outbox"
+    /// The last placement answers, per person (PlacementManager.swift) and per
+    /// workspace: the key carries the SDK key like the flags cache
+    /// (FlagsManager.storageKey), because the kv table is one database per app.
+    static func placementsStorageKey(sdkKey: String) -> String { "jry_\(sdkKey)_placements_cache" }
+    /// The unscoped key of builds before 2026-11-21: never read, removed at start.
+    static let legacyPlacementsStorageKey = "placements_cache"
+    /// The last card feed, per person (CardManager.swift) and per workspace,
+    /// like the placements cache above: the key carries the SDK key.
+    static func cardsStorageKey(sdkKey: String) -> String { "jry_\(sdkKey)_cards_cache" }
+    /// An anonymous visitor's read / dismissed card ids (`stateScope: "device"`), per
+    /// workspace; cleared on identify / reset.
+    static func cardsDeviceStateStorageKey(sdkKey: String) -> String { "jry_\(sdkKey)_cards_device_state" }
+    /// The unscoped keys of builds before 2026-11-21: never read, removed at start.
+    static let legacyCardsStorageKey = "cards_cache"
+    static let legacyCardsDeviceStateStorageKey = "cards_device_state"
 
     /// Has the device been unlocked since it started? See the class doc and
     /// `KeychainHelper.isProtectedDataAvailable()`: the same Keychain probe on
@@ -1021,6 +1143,11 @@ public class Joryio {
             return
         }
 
+        // Read BEFORE the check below: an optOut() on another thread between
+        // the check and the insert must still discard this event (as on
+        // Android). It used to be inserted after the opt-out had cleared the
+        // queue, and stayed there to go out with the next optIn().
+        let queueGeneration = queue?.generation
         guard canCollect else {
             logger.debug("Tracking not permitted (opted out or consent denied), skipping \(eventName)")
             return
@@ -1033,13 +1160,16 @@ public class Joryio {
             trackSessionStartEvent()
         }
 
-        record(eventName, properties: properties)
+        record(eventName, properties: properties, generation: queueGeneration)
     }
 
     /// Queue one event under the current ids, and show anything it triggers.
     /// No buffer, no session check: track() and the Session Start path
     /// have done both.
-    private func record(_ eventName: String, properties: EventProperties) {
+    ///
+    /// - Parameter generation: the queue's generation when the event was
+    ///   tracked (see `QueueManager.enqueue(_:generation:)`); nil = now.
+    private func record(_ eventName: String, properties: EventProperties, generation: Int? = nil) {
         let event = Event(
             type: eventName,
             properties: properties,
@@ -1049,7 +1179,7 @@ public class Joryio {
             sessionId: session.getSessionId()
         )
 
-        queue.enqueue(event)
+        queue.enqueue(event, generation: generation)
 
         logger.debug("Event tracked: \(eventName)")
 
@@ -1057,6 +1187,13 @@ public class Joryio {
         // the event is queued: the event is data and must be recorded whether
         // or not it triggers a message.
         inAppMessaging?.onEventTracked(eventName, properties: properties)
+        placementManager?.onEventTracked(eventName, properties: properties, event: event)
+        // A screen view also moves the time_on_screen clock (ScreenClock.swift) -
+        // from the event, so a queued trackScreen replayed after initialize()
+        // and a hand-written track("Screen Viewed") count too.
+        if eventName == "Screen Viewed", let screen = properties["screen_name"] as? String {
+            inAppMessaging?.screenViewed(screen)
+        }
     }
 
     // MARK: Event limits - the backend's, published in its batch contract
@@ -1163,6 +1300,7 @@ public class Joryio {
         // NEW user (`plan` of one person written on another's profile), and
         // their queued events were sent with the new user's token, refused,
         // and dropped.
+        let switchingUser = identity.getUserId().map { $0 != userId } ?? false
         if let previous = identity.getUserId(), previous != userId {
             handOverPreviousUser(previous, to: userId)
         }
@@ -1178,6 +1316,12 @@ public class Joryio {
         // A sync already in flight, and a display waiting on its delay, were
         // for the previous identity (SDK contract 26, v4 43).
         inAppMessaging.invalidate()
+        placementManager?.invalidate()
+        // A new person: the anonymous visitor's read / dismissed state goes too.
+        cardManager?.invalidate(clearDeviceState: true)
+        // Flags: the held answer was the previous identity's; another user's
+        // exposure marks go too (D479, the beta.11 attribute rule).
+        flagsManager?.onIdentityChanged(clearExposureMarks: switchingUser)
 
         // Re-register the stored device token against the new identity so a
         // token first captured while anonymous becomes bound to this user.
@@ -1349,10 +1493,40 @@ public class Joryio {
             storage.setOptOutMarkerAcked(value)
             // The opt-out may have changed again while this was in flight.
             syncOptOutMarker()
+        case .flagExposures:
+            // Taken, or refused for good: never sent again, so its marks are stored.
+            flagsManager?.exposuresSettled(entry.body)
         case .alias, .subscription, .pushUnregister, .attributes:
             break
         }
         pruneRetiredTokens()
+    }
+
+    /// A flag exposures batch the server did not take: into the outbox as it
+    /// was sent. At most FLAG_EXPOSURE_MARKS_MAX exposures wait there (the
+    /// oldest batch goes first), so exposures never crowd out the profile writes.
+    ///
+    /// It counts as having failed once (1.4.0-beta.14): its first outbox
+    /// attempt waits the first backoff step, or the failed send's Retry-After
+    /// when longer - the kick below no longer re-sends it milliseconds later.
+    private func enqueueFlagExposures(_ body: String, retryAfter: TimeInterval? = nil) {
+        guard let outbox = exposureOutbox else { return }
+        let incoming = exposureMarks(body).count
+        while true {
+            let waiting = outbox.snapshot()
+            guard let oldest = waiting.first,
+                  waiting.reduce(0, { $0 + exposureMarks($1.body).count }) + incoming > JoryioFlags.FLAG_EXPOSURE_MARKS_MAX else { break }
+            outbox.removeAll { $0.id == oldest.id }
+        }
+        let ids = (try? JSONSerialization.jsonObject(with: Data(body.utf8))) as? [String: Any]
+        outbox.addAfterFailedSend(OutboxEntry(
+            kind: .flagExposures,
+            path: "/v1/flags/exposures",
+            body: body,
+            userId: ids?["userId"] as? String,
+            anonymousId: ids?["anonymousId"] as? String
+        ), retryAfter: retryAfter)
+        outbox.kick()
     }
 
     /// Users with a withdrawal still queued - an unsubscribe, the opt-out
@@ -1379,7 +1553,7 @@ public class Joryio {
         let users = authStore.retiredUserIds
         guard !users.isEmpty else { return }
         let pushEntries = pushNotifications?.unregisterOutbox.snapshot() ?? []
-        let outboxUsers = Set((outbox.snapshot() + pushEntries).compactMap(\.userId))
+        let outboxUsers = Set((outbox.snapshot() + exposureOutbox.snapshot() + pushEntries).compactMap(\.userId))
         // The user requests are made for now - identified, or held while
         // tracking is off (D-b) - keeps a token filed under them: a held
         // user's withdrawals carry it (SDK contract v7, 72).
@@ -1435,6 +1609,7 @@ public class Joryio {
     /// resumes.
     private func retryOwedRequests(force: Bool = false) {
         outbox.kick(force: force)
+        exposureOutbox.kick(force: force)
         pushNotifications.retryPendingUnregisters(force: force)
     }
 
@@ -1468,7 +1643,48 @@ public class Joryio {
     /// waiting to reach the server. Safe before `initialize()`.
     public func reset() {
         guard runNowOrQueue({ $0.reset() }, purgeable: false) else { return }
+        resetIdentity(adopting: nil)
+    }
 
+    /// `reset()`, then adopt `anonymousId` instead of a new random id (BACKLOG
+    /// D366). For a host that keeps its own visitor id, so the SDK and the
+    /// host stay ONE visitor after a logout.
+    ///
+    /// Everything `reset()` does happens. The id must be 8 to 255 letters,
+    /// digits, `.`, `_`, `:` or `-`, must not have the shape of a Joryio
+    /// profile id (24 lowercase hex), must not be the user id this SDK holds
+    /// (signed in, or kept for withdrawals), and must not be the anonymous id
+    /// it holds while a user is signed in (that id is tied to the signed-in
+    /// user's profile). A refused id is logged and the call is a plain
+    /// `reset()` - a random id - so a logout is never skipped. The same rule
+    /// on all five SDKs. Safe before `initialize()`.
+    ///
+    /// `onResult` gets `true` when the id was adopted, `false` when it was
+    /// refused (a random id was used). It runs once, when the call runs: for
+    /// a call made before `initialize()`, after it; a held call discarded
+    /// before then never answers.
+    ///
+    /// An anonymous id is a claim, not a credential: whoever holds one already
+    /// tied to an identified profile is treated as that visitor, unless SDK
+    /// Authentication is on (anonymous writes to an identified profile are
+    /// then refused). Adopt only ids your own app issued for this device.
+    public func resetTo(_ anonymousId: String, onResult: ((Bool) -> Void)? = nil) {
+        // Exactly once: the run answers true / false, a discarded held call false.
+        let answer = onResult.map(ResetTo.once)
+        guard runNowOrQueue({ $0.resetTo(anonymousId, onResult: answer) }, purgeable: false, dropped: answer.map { a in { a(false) } }) else { return }
+        let userId = identity.getUserId()
+        let refusal = ResetTo.refusal(
+            anonymousId,
+            knownUserIds: [userId, identity.withdrawalUserId()],
+            signedInAnonymousId: userId != nil ? identity.getAnonymousId() : nil,
+            rememberedSignedInAnonymousIds: storage.getSignedInAnonymousIds()
+        )
+        if let refusal { logger.error("\(refusal); a random anonymous id is used instead") }
+        resetIdentity(adopting: refusal == nil ? anonymousId : nil)
+        answer?(refusal == nil)
+    }
+
+    private func resetIdentity(adopting anonymousId: String?) {
         logger.info("Resetting SDK state")
 
         cancelAttributeFlush()
@@ -1484,12 +1700,22 @@ public class Joryio {
         // standby token for someone signing in next (contract v8, 82).
         authStore.retireToken(forUser: identity.withdrawalUserId())
 
-        identity.reset()
+        // The outgoing user's anonymous id is tied to their profile: a later
+        // resetTo() must never hand it to someone else (D366).
+        if identity.getUserId() != nil { storage.rememberSignedInAnonymousId(identity.getAnonymousId()) }
+        identity.reset(adopting: anonymousId)
         session.resetSession()
+        // A click-link token held for the outgoing visitor is not the next one's.
+        locked { _heldLinkTokens.removeAll() }
 
         // The next user never sees the previous user's campaigns, and nothing
         // scheduled for the previous user fires.
         inAppMessaging.clear()
+        placementManager?.invalidate()
+        cardManager?.invalidate(clearDeviceState: true)
+        // Nor the previous user's flags; their unsent exposures go as them,
+        // and their exposure marks are forgotten (D479).
+        flagsManager?.onIdentityChanged(clearExposureMarks: true)
 
         // Now send what the outgoing identity left queued.
         queue.flushSync()
@@ -1828,6 +2054,10 @@ public class Joryio {
         // delay is not shown (v4, 43).
         discardCollectedData(owesSessionStart: true)
         inAppMessaging.invalidate()
+        placementManager?.invalidate()
+        cardManager?.invalidate(clearDeviceState: false)
+        // Flags: unsent exposures are dropped; the getters answer the defaults.
+        flagsManager?.onIdentityChanged()
 
         // The consent RECORD - not tracking: the only way the server learns
         // the person opted out on this device.
@@ -1854,6 +2084,9 @@ public class Joryio {
         storage?.clearReportedPushPermission()
         queue?.clearQueue()
         outbox?.removeAll { $0.isCollection }
+        // Flag exposures are collection only: all of them go, on disk too.
+        exposureOutbox?.removeAll { _ in true }
+        locked { _heldLinkTokens.removeAll() }
         if owesSessionStart { markSessionStartOwed() }
     }
 
@@ -1921,12 +2154,18 @@ public class Joryio {
         storage.clearSession()
         storage.setUserId(nil)
         storage.clearDeviceId()
+        // Local data like any other (D366): resetTo's memory of signed-in
+        // users' anonymous ids goes with the wipe, the same on all five SDKs.
+        storage.clearSignedInAnonymousIds()
         inAppMessaging.clear()
+        placementManager?.invalidate()
+        cardManager?.invalidate(clearDeviceState: true)
         // The anonymous id too, in storage AND in memory - it is the key the
         // erased profile was filed under. Clear storage first, then let the
         // identity manager mint the replacement.
         storage.clearAnonymousId()
         identity.onDataWiped()
+        flagsManager?.wipe()
         session.resetSession()
         // The new session is the new anonymous id's: announced by the next
         // event (or foreground), as Android does by ending the session. It
@@ -1969,6 +2208,9 @@ public class Joryio {
             return
         }
         inAppMessaging.invalidate()
+        placementManager?.invalidate()
+        cardManager?.invalidate(clearDeviceState: false)
+        flagsManager?.onIdentityChanged()
         releaseOwedSessionStart()
         resumeSending()
     }
@@ -2070,7 +2312,13 @@ public class Joryio {
         let previous = self.consent
         self.consent = consent
         logger.info("Tracking consent \(previous.rawValue) -> \(consent.rawValue)")
-        if previous != consent { inAppMessaging.invalidate() }
+        if previous != consent {
+            inAppMessaging.invalidate()
+            placementManager?.invalidate()
+            cardManager?.invalidate(clearDeviceState: false)
+            // Flags: a withdrawal drops unsent exposures; a grant fetches.
+            flagsManager?.onIdentityChanged()
+        }
 
         switch consent {
         case .denied:
@@ -2084,6 +2332,7 @@ public class Joryio {
             // The opt-out record may have waited for consent.
             syncOptOutMarker()
             outbox.kick(force: true)
+            exposureOutbox.kick(force: true)
             guard canSend else { return }
             releaseOwedSessionStart()
             resumeSending()
@@ -2114,7 +2363,7 @@ public class Joryio {
         // this identify is older than all of them, so it goes first.
         bufferLock.lock()
         if !preInitDrained, replayThread != Thread.current {
-            preInitCalls.insert(({ $0.identify(held) }, true, nil), at: 0)
+            preInitCalls.insert(({ $0.identify(held) }, true, nil, nil), at: 0)
             bufferLock.unlock()
             return
         }
@@ -2154,6 +2403,7 @@ public class Joryio {
         queue.resetBackoff()
         queue.flushSync(force: true)
         retryOwedRequests(force: true)
+        releaseHeldLinkTokens()
         pushNotifications.retryRegistrationIfUnconfirmed()
         Task { [weak self] in
             guard let self else { return }
@@ -2418,6 +2668,147 @@ public class Joryio {
         await inAppMessaging?.onPushTapped()
     }
 
+    // MARK: - Placements (docs/PLACEMENTS_PLAN.md, D444)
+
+    /// What a placement request may carry (plan 3.9): nil = nothing may be
+    /// sent; `granted` = the person is named and their interactions reported;
+    /// `pending` / `denied` (opted out included) = an anonymous request for
+    /// content meant for everyone, nothing reported.
+    private func placementConsent() -> String? {
+        guard isInitialized else { return nil }
+        if canSend { return "granted" }
+        return locked { !_isOptedOut && _consent == .pending } ? "pending" : "denied"
+    }
+
+    /**
+     The placements for `placementKeys`, to draw with your own UI; `completion`
+     runs on the main thread. Report what the person did with
+     `item.markDisplayed()` (once at least half of it was on screen for
+     `InAppDisplay.IN_APP_DISPLAY_DWELL_MS`), `item.markClicked()` and
+     `item.markDismissed()`; for a held-out person (`isControl`),
+     `placement.markDisplayed()` when the empty spot was on screen.
+     */
+    public func getPlacements(_ placementKeys: [String], completion: @escaping ([String: Placement]) -> Void) {
+        guard isInitialized, let placementManager else {
+            DispatchQueue.main.async { completion([:]) }
+            return
+        }
+        placementManager.getPlacements(placementKeys, completion: completion)
+    }
+
+    /// `getPlacements(_:completion:)` for async code.
+    public func getPlacements(_ placementKeys: [String]) async -> [String: Placement] {
+        guard isInitialized, let placementManager else { return [:] }
+        return await placementManager.getPlacements(placementKeys)
+    }
+
+    /// Ask the server again for `placementKeys` (nil = every placement on screen or cached).
+    /// At most once per key per `Placements.PLACEMENT_MIN_REFRESH_SECONDS`; extra calls coalesce.
+    public func refreshPlacements(_ placementKeys: [String]? = nil) {
+        guard isInitialized else { return }
+        placementManager?.refreshPlacements(placementKeys)
+    }
+
+    /// Called on the main thread with the placements whose content changed. `cancel()` the result to stop.
+    @discardableResult
+    public func onPlacementsUpdated(_ listener: @escaping ([String: Placement]) -> Void) -> JoryioSubscription {
+        guard isInitialized, let placementManager else {
+            logger?.error("onPlacementsUpdated() before initialize(): not registered")
+            return JoryioSubscription {}
+        }
+        return placementManager.onPlacementsUpdated(listener)
+    }
+
+    /// For Joryio's own placement views (PlacementView, the React Native view).
+    /// Returns false before `initialize()` (the view tries again).
+    @discardableResult
+    public func attachPlacementHost(_ host: PlacementHost) -> Bool {
+        guard isInitialized, let placementManager else { return false }
+        placementManager.attach(host)
+        return true
+    }
+
+    /// For Joryio's own placement views.
+    public func detachPlacementHost(_ host: PlacementHost) {
+        placementManager?.detach(host)
+    }
+
+    // MARK: - Content cards (docs/PLACEMENTS_PLAN.md section 11, D444)
+
+    /**
+     The person's card feed - pinned first, newest first - with the unread
+     count for a badge. Served from the cache for `Cards.CARD_FEED_TTL_SECONDS`;
+     `completion` runs on the main thread. Pass a feed's `nextCursor` as
+     `cursor` for the next page (it is added to the cached feed). Draw it with
+     `CardFeedViewController` / `JoryioCardFeed`, or yourself and report with
+     `markCardViewed`, `markCardRead`, `markCardClicked` and `dismissCard`.
+     */
+    public func getCards(cursor: String? = nil, completion: @escaping (CardFeed) -> Void) {
+        guard isInitialized, let cardManager else {
+            DispatchQueue.main.async { completion(.empty) }
+            return
+        }
+        cardManager.getCards(cursor: cursor, completion: completion)
+    }
+
+    /// `getCards(cursor:completion:)` for async code.
+    public func getCards(cursor: String? = nil) async -> CardFeed {
+        guard isInitialized, let cardManager else { return .empty }
+        return await cardManager.getCards(cursor: cursor)
+    }
+
+    /// Unread cards, from the cache (never a network call): the badge.
+    public func getUnreadCardCount() -> Int {
+        cardManager?.getUnreadCardCount() ?? 0
+    }
+
+    /// The card was on screen (`viewed`). Once per card; the feed views do it themselves.
+    public func markCardViewed(_ card: Card) { cardManager?.markCardViewed(card.id, token: card.deliveryToken) }
+    public func markCardViewed(_ cardId: String) { cardManager?.markCardViewed(cardId) }
+
+    /// The person read the card (`read`): it stops counting as unread at once.
+    public func markCardRead(_ card: Card) { cardManager?.markCardRead(card.id, token: card.deliveryToken) }
+    public func markCardRead(_ cardId: String) { cardManager?.markCardRead(cardId) }
+
+    /// The person tapped the card or its button (`clicked`, which also marks it read). Open its url yourself.
+    public func markCardClicked(_ card: Card) { cardManager?.markCardClicked(card.id, token: card.deliveryToken) }
+    public func markCardClicked(_ cardId: String) { cardManager?.markCardClicked(cardId) }
+
+    /// The person removed the card (`dismissed`): it leaves the feed at once and never comes back.
+    public func dismissCard(_ card: Card) { cardManager?.dismissCard(card.id, token: card.deliveryToken) }
+    public func dismissCard(_ cardId: String) { cardManager?.dismissCard(cardId) }
+
+    /// Ask the server for the feed again. At most once per `Cards.CARD_MIN_REFRESH_SECONDS`;
+    /// extra calls coalesce into one at the end of that window.
+    public func refreshCards() {
+        guard isInitialized else { return }
+        cardManager?.refreshCards()
+    }
+
+    /// Called on the main thread with the whole feed whenever it changes - the
+    /// way to keep a feed UI of your own up to date. `cancel()` the result to
+    /// stop (a `JoryioSubscription`, the same name and `cancel()` on every
+    /// Joryio SDK). Call it after `initialize()`; before, nothing is registered.
+    @discardableResult
+    public func onCardsUpdated(_ listener: @escaping (CardFeed) -> Void) -> JoryioSubscription {
+        guard isInitialized, let cardManager else {
+            logger?.error("onCardsUpdated() before initialize(): not registered")
+            return JoryioSubscription {}
+        }
+        return cardManager.onCardsUpdated(listener)
+    }
+
+    /// SDK-internal (SPI): for Joryio's own card feed views and bridges
+    /// (CardFeedViewController, the React Native and Unity bridges). nil
+    /// before `initialize()`, so the caller tries again. An app uses
+    /// `onCardsUpdated` - the one listener every Joryio SDK has; Android, web,
+    /// React Native and Unity have no public equivalent of this either.
+    @_spi(JoryioInternal)
+    public func attachCardFeedListener(_ listener: @escaping (CardFeed) -> Void) -> JoryioSubscription? {
+        guard isInitialized, let cardManager else { return nil }
+        return cardManager.onCardsUpdated(listener)
+    }
+
     /// Fetch in-app campaigns now, bypassing the automatic-sync interval.
     public func syncInAppCampaigns() async {
         guard isInitialized else {
@@ -2488,6 +2879,32 @@ public class Joryio {
         }, capabilities: capabilities)
     }
 
+    // MARK: - Links
+
+    /// Receive EVERY link the SDK is about to open - an in-app message
+    /// button or link, a placement button, a card tap, a push tap - before it
+    /// opens: http(s) links and app deep links (`myapp://cart`) alike, with
+    /// where it came from (`link.source`: in_app, placement, card, push) and
+    /// the ids that go with it.
+    ///
+    /// Return true to take the link over (route it in your app), false to let
+    /// the SDK do what it does without a handler: open http(s) (through your
+    /// universal-link handling with `JoryioConfig.forwardUniversalLinks`) and
+    /// hand an app deep link to the view's `onDeepLink`, as before. To decide
+    /// later, return true and call `link.openDefault()` when you decline.
+    /// A refused scheme (`javascript:`, `data:`, `file:`, ...) never reaches
+    /// the handler. Called on the main thread. Safe before `initialize()`.
+    /// Same name on Android, React Native, Unity (`SetLinkHandler`) and web.
+    public func setLinkHandler(_ handler: @escaping JoryioLinkHandler) {
+        LinkRouter.handler = handler
+    }
+
+    /// Remove the handler set with `setLinkHandler(_:)`: links open as they
+    /// do without one.
+    public func clearLinkHandler() {
+        LinkRouter.handler = nil
+    }
+
     /// Hand in-app display back to the SDK: removes the callback set with
     /// `setInAppMessageCallback(_:capabilities:)`, so `JoryioUI` draws
     /// messages again and the capability report describes the SDK's own
@@ -2549,6 +2966,9 @@ public class Joryio {
             campaignId: campaignId,
             userId: identity.getUserId(),
             anonymousId: identity.getAnonymousId(),
+            // Looked up by campaign id, so a host-rendered message (React
+            // Native, Unity, a custom renderer) sends it too (D371 item 4).
+            formToken: inAppMessaging.formToken(forCampaignId: campaignId),
             values: encoded
         )
         do {
@@ -2744,6 +3164,85 @@ public class Joryio {
         return trimmed.unicodeScalars.allSatisfy { CharacterSet(charactersIn: "0123456789abcdefABCDEF").contains($0) }
     }
 
+    // MARK: - Click-link identity
+
+    /**
+     Recognise the person who clicked a tracked link in a Joryio message.
+
+     Pass the URL that opened the app - from `application(_:continue:restorationHandler:)`,
+     `scene(_:continue:)`, `application(_:open:options:)` or SwiftUI's
+     `onOpenURL`. When it carries the `jr_t` token the click redirect added,
+     this app's events are attributed to the contact the message was sent
+     to. Attribution only: the person is not identified and this profile is
+     never merged into the contact (only `identify()` does that).
+     Fire-and-forget; a URL without a well-formed `jr_t` does nothing.
+
+     - Already identified (`identify()` / a `userId`): nothing - a link never
+       overrides a stronger identity (the server enforces this too).
+     - Opted out or consent `.denied`: the token is dropped.
+     - Consent `.pending`: held in memory only and sent on `.granted`.
+     - Before `initialize()`: held in memory with the other calls made
+       before it, and handled at init.
+     - The same token twice in one process: sent once.
+
+     The token is never persisted, and never logged above debug.
+     */
+    public func identifyFromLink(_ url: URL) {
+        guard ClickIdentity.token(from: url) != nil else { return }
+        guard runNowOrQueue({ $0.identifyFromLink(url) }) else { return }
+        guard let token = ClickIdentity.token(from: url) else { return }
+        guard canCollect else {
+            logger.debug("Opted out or consent denied: click-link token dropped")
+            return
+        }
+        guard identity.getUserId() == nil else {
+            logger.debug("Already identified: click-link token ignored")
+            return
+        }
+        // nil: seen before. true: send now. false: held (consent pending).
+        let decision: Bool? = locked {
+            guard _acceptedLinkTokens.insert(token).inserted else { return nil }
+            if _isInitialized && !_isOptedOut && _consent == .granted { return true }
+            if _heldLinkTokens.count >= ClickIdentity.maxHeldTokens { _heldLinkTokens.removeFirst() }
+            _heldLinkTokens.append(token)
+            return false
+        }
+        switch decision {
+        case .some(true):
+            sendLinkToken(token)
+        case .some(false):
+            logger.debug("Consent pending: click-link token held in memory until a decision")
+        case .none:
+            logger.debug("Click-link token already handled in this process")
+        }
+    }
+
+    private func releaseHeldLinkTokens() {
+        let tokens: [String] = locked {
+            let held = _heldLinkTokens
+            _heldLinkTokens.removeAll()
+            return held
+        }
+        guard !tokens.isEmpty, canSend else { return }
+        // Identified while consent was pending: the stronger identity wins.
+        guard identity.getUserId() == nil else { return }
+        tokens.forEach { sendLinkToken($0) }
+    }
+
+    private func sendLinkToken(_ token: String) {
+        let request = IdentifyLinkRequest(token: token, anonymousId: identity.getAnonymousId())
+        let network = self.network
+        let logger = self.logger
+        Task {
+            // Best-effort: "ok" and "ignored" alike change nothing here.
+            do {
+                try await network?.identifyLink(request)
+            } catch {
+                logger?.debug("Click-link identity not sent: \(error.localizedDescription)")
+            }
+        }
+    }
+
     /// Track a push-notification click by tracking id.
     /// Mirrors the Android SDK's `trackPushClick(String)`.
     public func trackPushClick(trackingId: String) {
@@ -2867,6 +3366,89 @@ public class Joryio {
         pushNotifications.unregister()
     }
 
+    // MARK: - Feature flags (BACKLOG D446)
+
+    /// Device context sent with every flags request; matched by attribute rules.
+    static func flagsContext() -> [String: Any] {
+        var context: [String: Any] = ["platform": "ios"]
+        if let locale = Locale.preferredLanguages.first { context["locale"] = locale }
+        if let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+            context["appVersion"] = appVersion
+        }
+        return context
+    }
+
+    /**
+     A flag's value for this person, or `defaultValue` before the first answer,
+     for a flag Joryio did not send, or without tracking consent. Never waits
+     for the network. The first read of a value in a session logs an exposure.
+     A JSON `null` reads as `nil`.
+     */
+    public func getFlag(_ key: String, default defaultValue: Any?) -> Any? {
+        guard isInitialized, let flagsManager else { return defaultValue }
+        return flagsManager.getFlag(key, default: defaultValue)
+    }
+
+    /// A boolean flag, or `defaultValue` (also for a flag of another type).
+    public func getBoolFlag(_ key: String, default defaultValue: Bool) -> Bool {
+        guard isInitialized, let flagsManager else { return defaultValue }
+        return flagsManager.getBoolFlag(key, default: defaultValue)
+    }
+
+    /// A string flag, or `defaultValue`.
+    public func getStringFlag(_ key: String, default defaultValue: String) -> String {
+        guard isInitialized, let flagsManager else { return defaultValue }
+        return flagsManager.getStringFlag(key, default: defaultValue)
+    }
+
+    /// A number flag, or `defaultValue`.
+    public func getNumberFlag(_ key: String, default defaultValue: Double) -> Double {
+        guard isInitialized, let flagsManager else { return defaultValue }
+        return flagsManager.getNumberFlag(key, default: defaultValue)
+    }
+
+    /// A JSON flag (dictionary, array or scalar, as `JSONSerialization` reads it), or `defaultValue`.
+    public func getJsonFlag(_ key: String, default defaultValue: Any?) -> Any? {
+        guard isInitialized, let flagsManager else { return defaultValue }
+        return flagsManager.getJsonFlag(key, default: defaultValue)
+    }
+
+    /// A JSON flag decoded into `T`, or `defaultValue` when it is missing or does not decode.
+    public func getJsonFlag<T: Decodable>(_ key: String, as type: T.Type, default defaultValue: T) -> T {
+        guard isInitialized, let flagsManager else { return defaultValue }
+        return flagsManager.getJsonFlag(key, as: type, default: defaultValue)
+    }
+
+    /// Every flag held for this person, key -> value (`NSNull` for a JSON null). Logs no exposure.
+    public func getAllFlags() -> [String: Any] {
+        guard isInitialized, let flagsManager else { return [:] }
+        return flagsManager.getAllFlags()
+    }
+
+    /// Fetch the flags now. Returns when the answer is in (or the request failed: the held flags stay).
+    public func refreshFlags() async {
+        guard isInitialized, let flagsManager else { return }
+        await flagsManager.refreshFlags()
+    }
+
+    /// `refreshFlags()` with a completion, called on the main thread.
+    public func refreshFlags(completion: @escaping () -> Void) {
+        Task {
+            await refreshFlags()
+            DispatchQueue.main.async { completion() }
+        }
+    }
+
+    /// Called on the main thread with the keys whose value changed. `cancel()` the result to stop.
+    @discardableResult
+    public func onFlagsUpdated(_ callback: @escaping ([String]) -> Void) -> JoryioSubscription {
+        guard isInitialized, let flagsManager else {
+            logger?.error("onFlagsUpdated() before initialize(): not registered")
+            return JoryioSubscription {}
+        }
+        return flagsManager.onFlagsUpdated(callback)
+    }
+
     // MARK: - Lifecycle Observers
 
     private func setupLifecycleObservers() {
@@ -2911,6 +3493,11 @@ public class Joryio {
         // No-op when the backend already confirmed this token.
         pushNotifications.retryRegistrationIfUnconfirmed()
 
+        // Placements on screen whose answer outlived its TTL.
+        placementManager?.onForeground()
+        // The card feed, when the app reads it and its TTL passed.
+        cardManager?.onForeground()
+
         // identify / addAlias / subscription changes that failed last time.
         retryOwedRequests()
 
@@ -2928,6 +3515,9 @@ public class Joryio {
             await flushPendingAttributes()
             await inAppMessaging.syncCampaigns()
         }
+
+        // Flags: at most once per JoryioFlags.FLAGS_MIN_REFRESH_SECONDS.
+        flagsManager?.onForeground()
     }
 
     private func onAppTerminating() {

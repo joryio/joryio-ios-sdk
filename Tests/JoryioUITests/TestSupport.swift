@@ -139,6 +139,8 @@ final class StubURLProtocol: URLProtocol {
     /// Seconds before the answer arrives - so a test can act while a request
     /// is IN FLIGHT. Answered asynchronously; a cancelled request gets none.
     static var delayFor: (URLRequest) -> TimeInterval = { _ in 0 }
+    /// Response headers (e.g. Retry-After) for a request; nil = none.
+    static var headersFor: (URLRequest) -> [String: String]? = { _ in nil }
     private var stopped = false
     private let stopLock = NSLock()
 
@@ -151,6 +153,7 @@ final class StubURLProtocol: URLProtocol {
         lock.lock(); _requests = []; lock.unlock()
         responder = { _ in (200, Data("{\"success\":true}".utf8)) }
         delayFor = { _ in 0 }
+        headersFor = { _ in nil }
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -180,12 +183,13 @@ final class StubURLProtocol: URLProtocol {
         var answered = request
         answered.httpBody = body
         let (status, data) = Self.responder(answered)
+        let headerFields = Self.headersFor(answered)
         let respond = { [self] in
             stopLock.lock()
             let cancelled = stopped
             stopLock.unlock()
             guard !cancelled else { return }
-            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
+            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headerFields)!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: data)
             client?.urlProtocolDidFinishLoading(self)

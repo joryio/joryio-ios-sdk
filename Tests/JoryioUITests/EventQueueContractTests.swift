@@ -50,6 +50,51 @@ final class EventQueueContractTests: XCTestCase {
         for name in names { try storage.enqueueEvent(TestSupport.event(name)) }
     }
 
+    /// An event tracked before an opt-out whose insert runs after the
+    /// opt-out cleared the queue. It used to be inserted anyway, and stayed
+    /// queued to go out with the next optIn() - Android already discarded it.
+    func testAnEventTrackedBeforeAClearIsDiscardedEvenWhenItsInsertRunsAfter() async throws {
+        let storage = TestSupport.storage()
+        let sender = FakeSender()
+        let queue = makeQueue(sender: sender, storage: storage)
+        queue.enqueue(TestSupport.event("old"))
+        let trackedBeforeClear = queue.generation
+        queue.clearQueue()
+        queue.enqueue(TestSupport.event("late"), generation: trackedBeforeClear)
+        queue.enqueue(TestSupport.event("new"), generation: queue.generation)
+
+        await queue.flush(force: true)
+
+        XCTAssertEqual(sender.sent.flatMap { $0 }.count, 1)
+        XCTAssertTrue(sender.sent.first?.first?.contains("\"new\"") == true)
+        XCTAssertEqual(try types(in: storage), [])
+    }
+
+    /// An optOut() - and an optIn() right after it, a consent toggle flipped
+    /// twice - landing after a flush took its rows and before the request
+    /// starts. The rows went out: an event tracked before optOut() was sent
+    /// or dropped depending on where the periodic flush happened to be.
+    func testRowsTakenBeforeAnOptOutAreNeverSentByARequestThatStartsAfterIt() async throws {
+        let storage = TestSupport.storage()
+        let sender = FakeSender()
+        let queue = makeQueue(sender: sender, storage: storage)
+        try enqueue(["tracked before optOut"], into: storage)
+        var checks = 0
+        queue.canSend = {
+            checks += 1
+            // 1: the flush starts. 2: the rows have been taken - the opt-out
+            // clears the queue now, and the opt-in allows sending again.
+            if checks == 2 { queue.clearQueue() }
+            return true
+        }
+
+        await queue.flush(force: true)
+        await queue.flush(force: true)
+
+        XCTAssertEqual(sender.sent.count, 0, "nothing tracked before the opt-out is sent")
+        XCTAssertEqual(try types(in: storage), [])
+    }
+
     func testRejectedBatchIsBisectedAndOnlyTheBadEventIsDropped() async throws {
         let storage = TestSupport.storage()
         try enqueue(["a", "b", "BAD", "d"], into: storage)
@@ -194,5 +239,72 @@ final class EventQueueContractTests: XCTestCase {
         let rows = (0..<5).map { StorageManager.QueuedEvent(id: Int64($0), json: "\"\(big)\"") }
         XCTAssertEqual(QueueManager.limitByBytes(rows).count, 2)
         XCTAssertEqual(QueueManager.limitByBytes([rows[0]]).count, 1, "a single event is always attempted")
+    }
+
+    // MARK: - "Show when" re-check gate (D465)
+
+    /// The first request waits until released: a flush "in flight".
+    final class GatedSender: EventBatchSender {
+        private let lock = NSLock()
+        private var gate: CheckedContinuation<Void, Never>?
+        private var gated = true
+        private(set) var sent: [[String]] = []
+        var started: (() -> Void)?
+
+        func sendEventBatch(_ eventsJSON: [String], userId: String?) async -> NetworkClient.BatchOutcome {
+            lock.lock(); sent.append(eventsJSON); let wait = gated; gated = false; lock.unlock()
+            if wait {
+                await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                    lock.lock(); gate = c; lock.unlock()
+                    started?()
+                }
+            }
+            return .accepted
+        }
+
+        func release() { lock.lock(); let g = gate; gate = nil; lock.unlock(); g?.resume() }
+        var count: Int { lock.lock(); defer { lock.unlock() }; return sent.count }
+    }
+
+    /// An event queued while a flush is already sending: deliver() waits for that
+    /// flush, flushes again, and answers true only once the event left the queue.
+    func testDeliverWaitsForTheFlushInFlightThenFlushesAgain() async throws {
+        let storage = TestSupport.storage()
+        try enqueue(["first"], into: storage)
+        let sender = GatedSender()
+        let queue = QueueManager(storage: storage, sender: sender, logger: TestSupport.logger(), batchSize: 50,
+                                 flushInterval: 3600, maxQueueSize: 1000, sendImmediately: false, startTimer: false)
+        let inFlight = expectation(description: "first flush is sending")
+        sender.started = { inFlight.fulfill() }
+        let first = Task { await queue.flush() }
+        await fulfillment(of: [inFlight], timeout: 2)
+
+        let event = TestSupport.event("add_to_cart")
+        try storage.enqueueEvent(event)
+        XCTAssertTrue(queue.isQueued(eventId: event.eventId))
+        let delivered = Task { await queue.deliver(eventId: event.eventId) }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(sender.count, 1, "nothing more is sent while the first flush is in flight")
+        sender.release()
+        _ = await first.value
+        let ok = await delivered.value
+        XCTAssertTrue(ok)
+        XCTAssertFalse(queue.isQueued(eventId: event.eventId))
+        XCTAssertEqual(sender.count, 2)
+        XCTAssertTrue(sender.sent[1].contains { $0.contains(event.eventId) })
+    }
+
+    /// A failed flush keeps the event: deliver() says so, and the caller waits.
+    func testDeliverAnswersFalseWhileTheEventIsStillQueued() async throws {
+        let storage = TestSupport.storage()
+        let event = TestSupport.event("add_to_cart")
+        try storage.enqueueEvent(event)
+        let sender = FakeSender()
+        sender.defaultAnswer = .retryLater(retryAfter: 60)
+        let queue = makeQueue(sender: sender, storage: storage)
+        let ok = await queue.deliver(eventId: event.eventId)
+        XCTAssertFalse(ok)
+        XCTAssertTrue(queue.isQueued(eventId: event.eventId))
+        XCTAssertEqual(sender.sent.count, 1, "the backoff holds the retries")
     }
 }
