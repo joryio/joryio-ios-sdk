@@ -1143,6 +1143,11 @@ public class Joryio {
             return
         }
 
+        // Read BEFORE the check below: an optOut() on another thread between
+        // the check and the insert must still discard this event (as on
+        // Android). It used to be inserted after the opt-out had cleared the
+        // queue, and stayed there to go out with the next optIn().
+        let queueGeneration = queue?.generation
         guard canCollect else {
             logger.debug("Tracking not permitted (opted out or consent denied), skipping \(eventName)")
             return
@@ -1155,13 +1160,16 @@ public class Joryio {
             trackSessionStartEvent()
         }
 
-        record(eventName, properties: properties)
+        record(eventName, properties: properties, generation: queueGeneration)
     }
 
     /// Queue one event under the current ids, and show anything it triggers.
     /// No buffer, no session check: track() and the Session Start path
     /// have done both.
-    private func record(_ eventName: String, properties: EventProperties) {
+    ///
+    /// - Parameter generation: the queue's generation when the event was
+    ///   tracked (see `QueueManager.enqueue(_:generation:)`); nil = now.
+    private func record(_ eventName: String, properties: EventProperties, generation: Int? = nil) {
         let event = Event(
             type: eventName,
             properties: properties,
@@ -1171,7 +1179,7 @@ public class Joryio {
             sessionId: session.getSessionId()
         )
 
-        queue.enqueue(event)
+        queue.enqueue(event, generation: generation)
 
         logger.debug("Event tracked: \(eventName)")
 

@@ -50,6 +50,51 @@ final class EventQueueContractTests: XCTestCase {
         for name in names { try storage.enqueueEvent(TestSupport.event(name)) }
     }
 
+    /// An event tracked before an opt-out whose insert runs after the
+    /// opt-out cleared the queue. It used to be inserted anyway, and stayed
+    /// queued to go out with the next optIn() - Android already discarded it.
+    func testAnEventTrackedBeforeAClearIsDiscardedEvenWhenItsInsertRunsAfter() async throws {
+        let storage = TestSupport.storage()
+        let sender = FakeSender()
+        let queue = makeQueue(sender: sender, storage: storage)
+        queue.enqueue(TestSupport.event("old"))
+        let trackedBeforeClear = queue.generation
+        queue.clearQueue()
+        queue.enqueue(TestSupport.event("late"), generation: trackedBeforeClear)
+        queue.enqueue(TestSupport.event("new"), generation: queue.generation)
+
+        await queue.flush(force: true)
+
+        XCTAssertEqual(sender.sent.flatMap { $0 }.count, 1)
+        XCTAssertTrue(sender.sent.first?.first?.contains("\"new\"") == true)
+        XCTAssertEqual(try types(in: storage), [])
+    }
+
+    /// An optOut() - and an optIn() right after it, a consent toggle flipped
+    /// twice - landing after a flush took its rows and before the request
+    /// starts. The rows went out: an event tracked before optOut() was sent
+    /// or dropped depending on where the periodic flush happened to be.
+    func testRowsTakenBeforeAnOptOutAreNeverSentByARequestThatStartsAfterIt() async throws {
+        let storage = TestSupport.storage()
+        let sender = FakeSender()
+        let queue = makeQueue(sender: sender, storage: storage)
+        try enqueue(["tracked before optOut"], into: storage)
+        var checks = 0
+        queue.canSend = {
+            checks += 1
+            // 1: the flush starts. 2: the rows have been taken - the opt-out
+            // clears the queue now, and the opt-in allows sending again.
+            if checks == 2 { queue.clearQueue() }
+            return true
+        }
+
+        await queue.flush(force: true)
+        await queue.flush(force: true)
+
+        XCTAssertEqual(sender.sent.count, 0, "nothing tracked before the opt-out is sent")
+        XCTAssertEqual(try types(in: storage), [])
+    }
+
     func testRejectedBatchIsBisectedAndOnlyTheBadEventIsDropped() async throws {
         let storage = TestSupport.storage()
         try enqueue(["a", "b", "BAD", "d"], into: storage)
